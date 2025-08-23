@@ -29,7 +29,7 @@ const PORT = process.env.PORT || 3001;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Constants
-const INTRO_VOICE = 'alloy';
+const INTRO_VOICE = 'ballad';
 const QUESTIONS_VOICE = 'echo';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
 
@@ -192,9 +192,23 @@ fastify.register(async (fastify) => {
                             body: JSON.stringify({
                                 conversation_id: conversationId,
                                 role: 'user',
-                                content: response.transcript
+                                content: response.transcript,
+                                metadata: {
+                                    audio_duration: response.audio_end_ms - response.audio_start_ms,
+                                    timestamp: new Date().toISOString()
+                                }
                             })
                         }).catch(err => console.error('Error saving user message:', err));
+                        
+                        // Extract clinical data from user response
+                        fetch(`http://localhost:${PORT}/api/extract-clinical-data`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                conversation_id: conversationId,
+                                text: response.transcript
+                            })
+                        }).catch(err => console.error('Error extracting clinical data:', err));
                     }
                 }
                 
@@ -213,9 +227,40 @@ fastify.register(async (fastify) => {
                             body: JSON.stringify({
                                 conversation_id: conversationId,
                                 role: 'assistant',
-                                content: aiContent
+                                content: aiContent,
+                                metadata: {
+                                    response_id: response.response.id,
+                                    voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE,
+                                    timestamp: new Date().toISOString()
+                                }
                             })
                         }).catch(err => console.error('Error saving AI message:', err));
+                    }
+                }
+                
+                // Handle conversation item creation for better message tracking
+                if (response.type === 'conversation.item.created' && response.item) {
+                    const conversationId = req.query.conversation_id;
+                    const item = response.item;
+                    
+                    if (item.type === 'message' && item.role === 'assistant' && conversationId) {
+                        const content = item.content?.[0]?.transcript || item.content?.[0]?.text || 'Assistant message';
+                        console.log('Assistant message created:', content);
+                        
+                        // Save assistant message
+                        fetch(`http://localhost:${PORT}/api/messages`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                conversation_id: conversationId,
+                                role: 'assistant',
+                                content: content,
+                                metadata: {
+                                    item_id: item.id,
+                                    voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
+                                }
+                            })
+                        }).catch(err => console.error('Error saving assistant message:', err));
                     }
                 }
                 
@@ -268,6 +313,173 @@ fastify.register(async (fastify) => {
             console.error('Error in the OpenAI WebSocket:', error);
         });
     });
+});
+
+// Clinical data extraction endpoint
+fastify.post('/api/extract-clinical-data', async (request, reply) => {
+    try {
+        const { conversation_id, text } = request.body;
+        
+        if (!conversation_id || !text) {
+            return reply.status(400).send({ error: 'Missing conversation_id or text' });
+        }
+
+        // Use OpenAI to extract clinical information
+        const extractionPrompt = `Extract clinical information from this patient response: "${text}"
+        
+        Identify and extract:
+        - Chief complaint
+        - Symptoms
+        - Medical history
+        - Current medications
+        - Allergies
+        - Pain levels
+        - Duration of symptoms
+        - Family history
+        - Social history
+        
+        Return as JSON with field_name and field_value pairs. Only include fields that are mentioned.`;
+
+        const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'gpt-4',
+                messages: [{ role: 'user', content: extractionPrompt }],
+                temperature: 0.1
+            })
+        });
+
+        const aiResult = await openaiResponse.json();
+        const extractedData = aiResult.choices[0].message.content;
+
+        try {
+            const clinicalFields = JSON.parse(extractedData);
+            
+            // Save each extracted field to clinical_extractions table
+            for (const [fieldName, fieldValue] of Object.entries(clinicalFields)) {
+                if (fieldValue && fieldValue.trim()) {
+                    await supabase
+                        .from('clinical_extractions')
+                        .insert({
+                            conversation_id,
+                            field_name: fieldName,
+                            field_value: fieldValue,
+                            confidence_score: 0.8
+                        });
+                }
+            }
+
+            // Update conversation with clinical data
+            const { data: existingConversation } = await supabase
+                .from('conversations')
+                .select('clinical_data')
+                .eq('id', conversation_id)
+                .single();
+
+            const updatedClinicalData = {
+                ...existingConversation?.clinical_data || {},
+                ...clinicalFields
+            };
+
+            await supabase
+                .from('conversations')
+                .update({ 
+                    clinical_data: updatedClinicalData,
+                    updated_at: new Date().toISOString()
+                })
+                .eq('id', conversation_id);
+
+        } catch (parseError) {
+            console.log('Could not parse clinical data as JSON, saving as text:', extractedData);
+        }
+
+        reply.send({ success: true, extracted_data: extractedData });
+    } catch (error) {
+        console.error('Error extracting clinical data:', error);
+        reply.status(500).send({ error: 'Failed to extract clinical data' });
+    }
+});
+
+// Export conversation data endpoint
+fastify.get('/api/conversations/:id/export', async (request, reply) => {
+    try {
+        const conversationId = request.params.id;
+
+        // Get conversation details
+        const { data: conversation, error: convError } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('id', conversationId)
+            .single();
+
+        if (convError) {
+            return reply.status(404).send({ error: 'Conversation not found' });
+        }
+
+        // Get all messages for this conversation
+        const { data: messages, error: msgError } = await supabase
+            .from('messages')
+            .select('*')
+            .eq('conversation_id', conversationId)
+            .order('timestamp', { ascending: true });
+
+        if (msgError) {
+            return reply.status(500).send({ error: 'Failed to fetch messages' });
+        }
+
+        // Get clinical extractions
+        const { data: clinicalExtractions, error: clinError } = await supabase
+            .from('clinical_extractions')
+            .select('*')
+            .eq('conversation_id', conversationId)
+            .order('extracted_at', { ascending: true });
+
+        const exportData = {
+            conversation,
+            messages,
+            clinical_extractions: clinicalExtractions || [],
+            export_timestamp: new Date().toISOString()
+        };
+
+        reply.send(exportData);
+    } catch (error) {
+        console.error('Error exporting conversation:', error);
+        reply.status(500).send({ error: 'Failed to export conversation' });
+    }
+});
+
+// Export all conversations endpoint
+fastify.get('/api/conversations/export', async (request, reply) => {
+    try {
+        // Get all conversations with their messages and clinical data
+        const { data: conversations, error: convError } = await supabase
+            .from('conversations')
+            .select(`
+                *,
+                messages (*),
+                clinical_extractions (*)
+            `)
+            .order('started_at', { ascending: false });
+
+        if (convError) {
+            return reply.status(500).send({ error: 'Failed to fetch conversations' });
+        }
+
+        const exportData = {
+            conversations,
+            total_count: conversations.length,
+            export_timestamp: new Date().toISOString()
+        };
+
+        reply.send(exportData);
+    } catch (error) {
+        console.error('Error exporting all conversations:', error);
+        reply.status(500).send({ error: 'Failed to export conversations' });
+    }
 });
 
 // Health check endpoint
