@@ -23,13 +23,13 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 
 // Initialize Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Constants
-const INTRO_VOICE = 'ballad';
+const INTRO_VOICE = 'shimmer';
 const QUESTIONS_VOICE = 'echo';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
 
@@ -495,5 +495,5 @@ fastify.listen({ port: PORT }, (err) => {
     }
     console.log(`Server running on port ${PORT}`);
     console.log(`WebSocket server running on same port ${PORT}`);
-    console.log('Twilio webhook URL: https://a158ab71fe2a.ngrok.app/webhook/voice');
+    console.log('Twilio webhook URL: https://e204cd56b53c.ngrok.app/webhook/voice');
 });
