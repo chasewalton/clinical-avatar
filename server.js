@@ -11,7 +11,7 @@ import { v4 as uuidv4 } from 'uuid';
 dotenv.config();
 
 // Retrieve API keys
-const { OPENAI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
+const { OPENAI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, PUBLIC_BASE_URL } = process.env;
 
 if (!OPENAI_API_KEY) {
     console.error('Missing OpenAI API key. Please set it in the .env file.');
@@ -27,6 +27,9 @@ const PORT = process.env.PORT || 10000;
 
 // Initialize Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.warn('Supabase credentials are not fully set. Database operations may fail.');
+}
 
 // Constants
 const INTRO_VOICE = 'shimmer';
@@ -57,6 +60,39 @@ Keep responses concise, compassionate, and easy to understand.`;
 // Root Route
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Clinical Avatar Server is running!' });
+});
+
+// Persist messages endpoint
+fastify.post('/api/messages', async (request, reply) => {
+    try {
+        const { conversation_id, role, content, metadata } = request.body || {};
+
+        if (!conversation_id || !role || !content) {
+            return reply.status(400).send({ error: 'Missing conversation_id, role, or content' });
+        }
+
+        const { data, error } = await supabase
+            .from('messages')
+            .insert({
+                conversation_id,
+                role,
+                content,
+                metadata: metadata || {},
+                timestamp: new Date().toISOString()
+            })
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Error saving message:', error);
+            return reply.status(500).send({ error: 'Failed to save message' });
+        }
+
+        reply.send({ success: true, message: data });
+    } catch (err) {
+        console.error('Unexpected error saving message:', err);
+        reply.status(500).send({ error: 'Unexpected error' });
+    }
 });
 
 // Route for Twilio to handle incoming calls with OpenAI Coral
@@ -488,12 +524,13 @@ fastify.get('/health', async (request, reply) => {
 });
 
 // Start the server
-fastify.listen({ port: PORT }, (err) => {
+fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     if (err) {
         console.error(err);
         process.exit(1);
     }
-    console.log(`Server running on port ${PORT}`);
-    console.log(`WebSocket server running on same port ${PORT}`);
-    console.log('Twilio webhook URL: https://e204cd56b53c.ngrok.app/webhook/voice');
+    const baseUrl = PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+    console.log(`Server running on ${baseUrl}`);
+    console.log(`WebSocket server running on same origin`);
+    console.log(`Twilio webhook URL: ${baseUrl.replace('http', 'https')}/webhook/voice`);
 });
