@@ -32,8 +32,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 // Constants
-const INTRO_VOICE = 'echo';
-const QUESTIONS_VOICE = 'echo';
+const INTRO_VOICE = 'alloy';
+const QUESTIONS_VOICE = 'alloy';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
 
 Flow at start of call:
@@ -193,6 +193,23 @@ fastify.register(async (fastify) => {
         
         let streamSid = null;
         let isIntroPhase = true;
+        let streamStarted = false;
+        let greetingSent = false;
+
+        const trySendGreeting = () => {
+            if (!greetingSent && streamStarted && openAiWs.readyState === WebSocket.OPEN) {
+                const initialGreeting = {
+                    type: 'response.create',
+                    response: {
+                        modalities: ['audio'],
+                        instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."`
+                    }
+                };
+                openAiWs.send(JSON.stringify(initialGreeting));
+                greetingSent = true;
+                console.log('Initial greeting sent');
+            }
+        };
         
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
@@ -215,7 +232,11 @@ fastify.register(async (fastify) => {
             
             openAiWs.send(JSON.stringify(sessionUpdate));
             
-            // Greeting will be sent once the Twilio stream has started (streamSid available)
+            // Greeting will be sent once sessionReady && streamStarted
+            // Fallback: in case one signal is delayed, try after 1.5s too
+            setTimeout(() => {
+                trySendGreeting();
+            }, 1500);
         });
 
         // Listen for messages from the OpenAI WebSocket
@@ -358,18 +379,9 @@ fastify.register(async (fastify) => {
                         break;
                     case 'start':
                         streamSid = data.start.streamSid;
+                        streamStarted = true;
                         console.log('Incoming stream has started', streamSid);
-                        // Now that we have a streamSid, send the initial greeting so caller hears it
-                        const initialGreeting = {
-                            type: 'response.create',
-                            response: {
-                                modalities: ['audio'],
-                                instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."`
-                            }
-                        };
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            openAiWs.send(JSON.stringify(initialGreeting));
-                        }
+                        trySendGreeting();
                         break;
                     default:
                         console.log('Received non-media event:', data.event);
