@@ -29,31 +29,44 @@ const PORT = process.env.PORT || 3001;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a clinical assistant for MUSC conducting a pre-appointment medical history interview. Ask ONE question at a time. Wait for the patient to answer before asking the next question. Be direct and concise - no filler words or multiple sentences. Start with: "Hi, I\'m your MUSC clinical assistant. What brings you to see the doctor today?"';
-const VOICE = 'alloy';
+const INTRO_VOICE = 'alloy';
+const QUESTIONS_VOICE = 'echo';
+const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
+
+Flow at start of call:
+1) After the call connects, immediately greet the caller with: "Hi, I am connecting you to MUSC's Clinical Assistant. Say \"Yes\" when you are ready to begin."
+2) Wait for the caller to consent by saying "Yes".
+3) Once consent is detected, begin intake: Introduce yourself as the MUSC Clinics AI assistant and proceed with natural, conversational intake questions. Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
+4) If the caller does not say "Yes", do not proceed with intake. If asked questions before consent, gently remind them: "Please say \"Yes\" when you are ready to begin."
+
+Comprehensive intake topics to cover naturally (do not read as a checklist; weave them into conversation based on context):
+- Chief complaint onset, duration, severity, triggers/relievers, associated symptoms
+- Past medical history: chronic conditions (e.g., hypertension, diabetes, asthma), prior hospitalizations, major illnesses
+- Past surgical history and dates
+- Medications: prescription, OTC, supplements; dosages and adherence
+- Allergies: medications, foods, environmental; reactions
+- Family history: major conditions in first-degree relatives (cardiac disease, cancer, diabetes, stroke, mental health)
+- Social history: tobacco/vaping, alcohol, recreational drugs; occupation; living situation; exercise; diet
+- Gynecologic/OB history when appropriate: LMP, pregnancy status, contraception, relevant screenings
+- Immunizations and preventive care: recent vaccines, screenings (colonoscopy, mammogram, Pap)
+- Review of systems: brief screen guided by the chief complaint
+
+Before closing, ask: "Is there anything else you'd like your provider to know before your visit?"
+Keep responses concise, compassionate, and easy to understand.`;
 
 // Root Route
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Clinical Avatar Server is running!' });
 });
 
-// Route for Twilio to handle incoming calls
+// Route for Twilio to handle incoming calls with OpenAI Coral
 fastify.all('/webhook/voice', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Say>Please wait while we connect your call to the clinical assistant.</Say>
-                              <Pause length="1"/>
-                              <Say>You can start talking!</Say>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
-                              </Connect>
-                          </Response>`;
+    const callSid = request.body.CallSid || `test-${Date.now()}`;
+    const from = request.body.From || 'unknown';
     
     // Create conversation in Supabase
+    let conversationId = null;
     try {
-        const callSid = request.body.CallSid || `test-${Date.now()}`;
-        const from = request.body.From || 'unknown';
-        
         const { data: conversation, error } = await supabase
             .from('conversations')
             .insert({
@@ -70,17 +83,26 @@ fastify.all('/webhook/voice', async (request, reply) => {
             console.error('Error creating conversation:', error);
         } else {
             console.log('Created conversation:', conversation.id);
+            conversationId = conversation.id;
         }
     } catch (error) {
         console.error('Error setting up call:', error);
     }
     
+    // TwiML response for direct OpenAI Coral integration
+    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+                          <Response>
+                              <Connect>
+                                  <Stream url="wss://${request.headers.host}/coral-stream?conversation_id=${conversationId}" />
+                              </Connect>
+                          </Response>`;
+    
     reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket route for media-stream
+// WebSocket route for OpenAI Coral integration
 fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+    fastify.get('/coral-stream', { websocket: true }, (connection, req) => {
         console.log('Client connected');
         
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
@@ -91,28 +113,38 @@ fastify.register(async (fastify) => {
         });
         
         let streamSid = null;
+        let isIntroPhase = true;
         
-        const sendSessionUpdate = () => {
+        openAiWs.on('open', () => {
+            console.log('Connected to OpenAI Realtime API');
+            
+            // Configure the session with intro voice
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
-                    turn_detection: { type: 'server_vad' },
+                    modalities: ['text', 'audio'],
+                    instructions: SYSTEM_MESSAGE,
+                    voice: INTRO_VOICE,
                     input_audio_format: 'g711_ulaw',
                     output_audio_format: 'g711_ulaw',
-                    voice: VOICE,
-                    instructions: SYSTEM_MESSAGE,
-                    modalities: ["text", "audio"],
-                    temperature: 0.8,
+                    input_audio_transcription: {
+                        model: 'whisper-1'
+                    }
                 }
             };
-            console.log('Sending session update');
+            
             openAiWs.send(JSON.stringify(sessionUpdate));
-        };
-
-        // Open event for OpenAI WebSocket
-        openAiWs.on('open', () => {
-            console.log('Connected to the OpenAI Realtime API');
-            setTimeout(sendSessionUpdate, 250);
+            
+            // Send initial greeting immediately
+            const initialGreeting = {
+                type: 'response.create',
+                response: {
+                    modalities: ['audio'],
+                    instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin."`
+                }
+            };
+            
+            openAiWs.send(JSON.stringify(initialGreeting));
         });
 
         // Listen for messages from the OpenAI WebSocket
@@ -136,26 +168,57 @@ fastify.register(async (fastify) => {
                 if (response.type === 'conversation.item.input_audio_transcription.completed') {
                     console.log('User said:', response.transcript);
                     
-                    // Save message to Supabase
-                    if (response.transcript) {
-                        supabase
-                            .from('messages')
-                            .insert({
-                                id: uuidv4(),
-                                conversation_id: streamSid, // Using streamSid as conversation reference
+                    // Switch to questions voice after first user input
+                    if (isIntroPhase) {
+                        isIntroPhase = false;
+                        const voiceUpdate = {
+                            type: 'session.update',
+                            session: {
+                                voice: QUESTIONS_VOICE
+                            }
+                        };
+                        openAiWs.send(JSON.stringify(voiceUpdate));
+                        console.log(`Switched to questions voice: ${QUESTIONS_VOICE}`);
+                    }
+                    
+                    // Get conversation ID from URL params
+                    const conversationId = req.query.conversation_id;
+                    
+                    // Save user message via API endpoint
+                    if (response.transcript && conversationId) {
+                        fetch(`http://localhost:${PORT}/api/messages`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                conversation_id: conversationId,
                                 role: 'user',
-                                content: response.transcript,
-                                created_at: new Date().toISOString()
+                                content: response.transcript
                             })
-                            .then(({ error }) => {
-                                if (error) console.error('Error saving user message:', error);
-                            });
+                        }).catch(err => console.error('Error saving user message:', err));
                     }
                 }
                 
-                if (response.type === 'response.done') {
+                if (response.type === 'response.done' && response.response) {
                     console.log('AI response completed');
+                    
+                    // Get conversation ID from URL params
+                    const conversationId = req.query.conversation_id;
+                    
+                    // Save AI response via API endpoint
+                    if (conversationId) {
+                        const aiContent = response.response.output?.[0]?.content?.[0]?.transcript || 'AI response';
+                        fetch(`http://localhost:${PORT}/api/messages`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                conversation_id: conversationId,
+                                role: 'assistant',
+                                content: aiContent
+                            })
+                        }).catch(err => console.error('Error saving AI message:', err));
+                    }
                 }
+                
                 
             } catch (error) {
                 console.error('Error processing OpenAI message:', error);
