@@ -108,9 +108,9 @@ fastify.all('/webhook/voice', async (request, reply) => {
             .insert({
                 id: uuidv4(),
                 call_sid: callSid,
-                caller_number: from,
+                phone_number: from,
                 status: 'active',
-                created_at: new Date().toISOString()
+                started_at: new Date().toISOString()
             })
             .select()
             .single();
