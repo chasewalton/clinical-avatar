@@ -32,12 +32,12 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 // Constants
-const INTRO_VOICE = 'ash';
+const INTRO_VOICE = 'echo';
 const QUESTIONS_VOICE = 'echo';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
 
 Flow at start of call:
-1) After the call connects, immediately greet the caller with: "Hi, I am connecting you to MUSC's Clinical Assistant. Say \"Yes\" when you are ready to begin."
+1) Immediately greet the caller with: "Hi, I am connecting you to MUSC's Clinical Assistant. Say \"Yes\" when you are ready to begin."
 2) Wait for the caller to consent by saying "Yes".
 3) Once consent is detected, begin intake: Introduce yourself as the MUSC Clinics AI assistant and proceed with natural, conversational intake questions. Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
 4) If the caller does not say "Yes", do not proceed with intake. If asked questions before consent, gently remind them: "Please say \"Yes\" when you are ready to begin."
@@ -364,7 +364,7 @@ fastify.register(async (fastify) => {
                             type: 'response.create',
                             response: {
                                 modalities: ['audio'],
-                                instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin."`
+                                instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."`
                             }
                         };
                         if (openAiWs.readyState === WebSocket.OPEN) {
