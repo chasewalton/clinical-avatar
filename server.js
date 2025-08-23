@@ -194,6 +194,7 @@ fastify.register(async (fastify) => {
         let isIntroPhase = true;
         let streamStarted = false;
         let greetingSent = false;
+        let wantGreeting = false;
 
         const trySendGreeting = () => {
             if (!greetingSent && streamStarted && openAiWs.readyState === WebSocket.OPEN) {
@@ -225,6 +226,12 @@ fastify.register(async (fastify) => {
                     output_audio_format: 'g711_ulaw',
                     input_audio_transcription: {
                         model: 'whisper-1'
+                    },
+                    turn_detection: {
+                        type: 'server_vad',
+                        threshold: 0.5,
+                        prefix_padding_ms: 300,
+                        silence_duration_ms: 200
                     }
                 }
             };
@@ -245,6 +252,8 @@ fastify.register(async (fastify) => {
                 
                 if (response.type === 'session.updated') {
                     console.log('Session updated successfully');
+                    wantGreeting = true;
+                    setTimeout(() => trySendGreeting(), 100);
                 }
                 
                 if (response.type === 'response.audio.delta' && response.delta) {
