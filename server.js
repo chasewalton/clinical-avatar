@@ -88,6 +88,7 @@ fastify.post('/api/messages', async (request, reply) => {
             return reply.status(500).send({ error: 'Failed to save message' });
         }
 
+        console.log('Message saved', { conversation_id, role, len: content.length });
         reply.send({ success: true, message: data });
     } catch (err) {
         console.error('Unexpected error saving message:', err);
@@ -97,8 +98,30 @@ fastify.post('/api/messages', async (request, reply) => {
 
 // Route for Twilio to handle incoming calls with OpenAI Coral
 fastify.all('/webhook/voice', async (request, reply) => {
-    const callSid = request.body.CallSid || `test-${Date.now()}`;
-    const from = request.body.From || 'unknown';
+    // Optionally validate Twilio signature if token is set
+    try {
+        const { TWILIO_AUTH_TOKEN } = process.env;
+        const signature = request.headers['x-twilio-signature'];
+        if (TWILIO_AUTH_TOKEN && signature) {
+            const url = `${request.protocol}://${request.headers.host}${request.raw.url.split('?')[0]}`;
+            const isValid = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, request.body || {});
+            if (!isValid) {
+                console.warn('Invalid Twilio signature; proceeding but marking as unverified');
+            }
+        }
+    } catch (e) {
+        console.warn('Twilio signature validation error:', e?.message);
+    }
+
+    const body = request.body || {};
+    const callSid = body.CallSid || `test-${Date.now()}`;
+    const from = body.From || 'unknown';
+    const to = body.To || 'unknown';
+    const accountSid = body.AccountSid || 'unknown';
+    const callStatus = body.CallStatus || 'queued';
+    const direction = body.Direction || 'inbound';
+    const callerCountry = body.CallerCountry || null;
+    const calledCountry = body.CalledCountry || null;
     
     // Create conversation in Supabase
     let conversationId = null;
@@ -110,7 +133,20 @@ fastify.all('/webhook/voice', async (request, reply) => {
                 call_sid: callSid,
                 phone_number: from,
                 status: 'active',
-                started_at: new Date().toISOString()
+                started_at: new Date().toISOString(),
+                metadata: {
+                    from,
+                    to,
+                    account_sid: accountSid,
+                    call_status: callStatus,
+                    direction,
+                    caller_country: callerCountry,
+                    called_country: calledCountry,
+                    request_info: {
+                        host: request.headers.host,
+                        user_agent: request.headers['user-agent'] || null
+                    }
+                }
             })
             .select()
             .single();
@@ -118,7 +154,14 @@ fastify.all('/webhook/voice', async (request, reply) => {
         if (error) {
             console.error('Error creating conversation:', error);
         } else {
-            console.log('Created conversation:', conversation.id);
+            console.log('Conversation created', {
+                id: conversation.id,
+                callSid,
+                from,
+                to,
+                status: conversation.status,
+                direction
+            });
             conversationId = conversation.id;
         }
     } catch (error) {
@@ -397,11 +440,11 @@ fastify.post('/api/extract-clinical-data', async (request, reply) => {
 
         try {
             const clinicalFields = JSON.parse(extractedData);
-            
+
             // Save each extracted field to clinical_extractions table
             for (const [fieldName, fieldValue] of Object.entries(clinicalFields)) {
                 if (fieldValue && fieldValue.trim()) {
-                    await supabase
+                    const { error: insertErr } = await supabase
                         .from('clinical_extractions')
                         .insert({
                             conversation_id,
@@ -409,28 +452,39 @@ fastify.post('/api/extract-clinical-data', async (request, reply) => {
                             field_value: fieldValue,
                             confidence_score: 0.8
                         });
+                    if (insertErr) {
+                        console.error('Error saving clinical extraction:', insertErr, { fieldName });
+                    }
                 }
             }
 
             // Update conversation with clinical data
-            const { data: existingConversation } = await supabase
+            const { data: existingConversation, error: fetchConvErr } = await supabase
                 .from('conversations')
                 .select('clinical_data')
                 .eq('id', conversation_id)
                 .single();
+            if (fetchConvErr) {
+                console.error('Error fetching conversation for update:', fetchConvErr);
+            }
 
             const updatedClinicalData = {
-                ...existingConversation?.clinical_data || {},
+                ...(existingConversation?.clinical_data || {}),
                 ...clinicalFields
             };
 
-            await supabase
+            const { error: updateConvErr } = await supabase
                 .from('conversations')
                 .update({ 
                     clinical_data: updatedClinicalData,
                     updated_at: new Date().toISOString()
                 })
                 .eq('id', conversation_id);
+            if (updateConvErr) {
+                console.error('Error updating conversation clinical_data:', updateConvErr);
+            }
+
+            console.log('Clinical fields extracted', { conversation_id, fields: Object.keys(clinicalFields) });
 
         } catch (parseError) {
             console.log('Could not parse clinical data as JSON, saving as text:', extractedData);
