@@ -61,6 +61,54 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Clinical Avatar Server is running!' });
 });
 
+// Build full transcript and update conversations.summary
+fastify.post('/api/conversations/:id/summary', async (request, reply) => {
+    try {
+        const conversationId = request.params.id;
+        const { mode } = request.body || {}; // optional: 'transcript' (default) | 'ai'
+
+        // Fetch messages ordered by timestamp
+        const { data: messages, error: msgError } = await supabase
+            .from('messages')
+            .select('role, content, timestamp')
+            .eq('conversation_id', conversationId)
+            .order('timestamp', { ascending: true });
+
+        if (msgError) {
+            console.error('Failed to fetch messages for summary:', msgError);
+            return reply.status(500).send({ error: 'Failed to fetch messages' });
+        }
+
+        if (!messages || messages.length === 0) {
+            return reply.status(400).send({ error: 'No messages to summarize' });
+        }
+
+        // Default: full transcript text (User/Assistant lines)
+        const transcript = messages
+            .map(m => `${m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Assistant' : 'System'}: ${m.content}`)
+            .join('\n');
+
+        // Update conversations.summary
+        const { data: updated, error: updError } = await supabase
+            .from('conversations')
+            .update({ summary: transcript, updated_at: new Date().toISOString() })
+            .eq('id', conversationId)
+            .select('id, summary')
+            .single();
+
+        if (updError) {
+            console.error('Failed to update conversation summary:', updError);
+            return reply.status(500).send({ error: 'Failed to update summary' });
+        }
+
+        console.log('Conversation summary updated', { id: conversationId, chars: transcript.length });
+        reply.send({ success: true, id: updated.id, summary_length: transcript.length });
+    } catch (error) {
+        console.error('Error building/updating summary:', error);
+        reply.status(500).send({ error: 'Unexpected error' });
+    }
+});
+
 // Persist messages endpoint
 fastify.post('/api/messages', async (request, reply) => {
     try {
