@@ -29,7 +29,7 @@ const PORT = process.env.PORT || 3001;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful clinical assistant conducting a pre-appointment medical history interview for MUSC. Ask about current symptoms, medications, allergies, family history, and other relevant medical information. Be conversational and empathetic. Start by introducing yourself and explaining the purpose of the call.';
+const SYSTEM_MESSAGE = 'You are a clinical assistant for MUSC conducting a pre-appointment medical history interview. Ask ONE question at a time. Wait for the patient to answer before asking the next question. Be direct and concise - no filler words or multiple sentences. Start with: "Hi, I\'m your MUSC clinical assistant. What brings you to see the doctor today?"';
 const VOICE = 'alloy';
 
 // Root Route
