@@ -32,7 +32,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 }
 
 // Constants
-const INTRO_VOICE = 'shimmer';
+const INTRO_VOICE = 'ash';
 const QUESTIONS_VOICE = 'echo';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
 
