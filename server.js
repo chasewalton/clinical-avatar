@@ -153,6 +153,7 @@ fastify.register(async (fastify) => {
         
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
+            let openAiReady = true;
             
             // Configure the session with intro voice
             const sessionUpdate = {
@@ -171,16 +172,7 @@ fastify.register(async (fastify) => {
             
             openAiWs.send(JSON.stringify(sessionUpdate));
             
-            // Send initial greeting immediately
-            const initialGreeting = {
-                type: 'response.create',
-                response: {
-                    modalities: ['audio'],
-                    instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin."`
-                }
-            };
-            
-            openAiWs.send(JSON.stringify(initialGreeting));
+            // Greeting will be sent once the Twilio stream has started (streamSid available)
         });
 
         // Listen for messages from the OpenAI WebSocket
@@ -324,6 +316,17 @@ fastify.register(async (fastify) => {
                     case 'start':
                         streamSid = data.start.streamSid;
                         console.log('Incoming stream has started', streamSid);
+                        // Now that we have a streamSid, send the initial greeting so caller hears it
+                        const initialGreeting = {
+                            type: 'response.create',
+                            response: {
+                                modalities: ['audio'],
+                                instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin."`
+                            }
+                        };
+                        if (openAiWs.readyState === WebSocket.OPEN) {
+                            openAiWs.send(JSON.stringify(initialGreeting));
+                        }
                         break;
                     default:
                         console.log('Received non-media event:', data.event);
