@@ -198,14 +198,26 @@ fastify.register(async (fastify) => {
 
         const trySendGreeting = () => {
             if (!greetingSent && streamStarted && openAiWs.readyState === WebSocket.OPEN) {
-                const initialGreeting = {
-                    type: 'response.create',
-                    response: {
-                        modalities: ['audio'],
-                        instructions: `Say exactly: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."`
+                // Create a conversation item first so the model has queued content
+                const greetingItem = {
+                    type: 'conversation.item.create',
+                    item: {
+                        type: 'message',
+                        role: 'assistant',
+                        content: [
+                            {
+                                type: 'input_text',
+                                text: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."
+                            }
+                        ]
                     }
                 };
-                openAiWs.send(JSON.stringify(initialGreeting));
+                openAiWs.send(JSON.stringify(greetingItem));
+
+                // Then trigger the response to render the item to audio
+                const createResponse = { type: 'response.create' };
+                openAiWs.send(JSON.stringify(createResponse));
+
                 greetingSent = true;
                 console.log('Initial greeting sent');
             }
