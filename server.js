@@ -307,9 +307,11 @@ fastify.register(async (fastify) => {
         const extractClinical = async (conversationId, text) => {
             try {
                 if (!text || !text.trim() || !conversationId) return;
-                const extractionPrompt = `Extract clinical information from this patient response: "${text}"
+                const extractionPrompt = `Extract clinical information strictly from this patient response (use only what is explicitly stated): "${text}"
 
-Identify and extract as a flat JSON object of key:value pairs only for fields that are mentioned (omit others):
+Return ONLY keys that are clearly mentioned in the text. If a key is not explicitly mentioned, DO NOT include it at all. Do not infer or guess.
+
+Identify and extract as a flat JSON object of key:value pairs only for fields that are mentioned (omit others entirely):
 - chief_complaint
 - symptoms
 - medical_history
@@ -343,6 +345,70 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                 }
                 if (!fields || typeof fields !== 'object') return;
 
+                // Normalize keys to canonical schema
+                const keyMap = {
+                    'chief complaint': 'chief_complaint',
+                    'chief_complaint': 'chief_complaint',
+                    'symptom': 'symptoms',
+                    'symptoms': 'symptoms',
+                    'past medical history': 'medical_history',
+                    'pmh': 'medical_history',
+                    'medical history': 'medical_history',
+                    'medical_history': 'medical_history',
+                    'medications': 'current_medications',
+                    'current meds': 'current_medications',
+                    'current medication': 'current_medications',
+                    'current medications': 'current_medications',
+                    'meds': 'current_medications',
+                    'allergy': 'allergies',
+                    'allergies': 'allergies',
+                    'pain': 'pain_level',
+                    'pain level': 'pain_level',
+                    'pain levels': 'pain_level',
+                    'duration of symptoms': 'duration',
+                    'symptom duration': 'duration',
+                    'duration_of_symptoms': 'duration',
+                    'family history': 'family_history',
+                    'family_history': 'family_history',
+                    'social history': 'social_history',
+                    'social_history': 'social_history',
+                    'duration': 'duration',
+                    'pain_level': 'pain_level'
+                };
+                const toSnake = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+                const normalizeKey = (k) => {
+                    const raw = String(k || '').trim().toLowerCase();
+                    if (keyMap[raw]) return keyMap[raw];
+                    const snake = toSnake(raw);
+                    return keyMap[snake] || snake;
+                };
+                const normalizedFields = {};
+                for (const [k, v] of Object.entries(fields)) {
+                    const nk = normalizeKey(k);
+                    normalizedFields[nk] = v;
+                }
+                fields = normalizedFields;
+
+                // Remove null/empty/unknown values and normalize strings
+                const cleaned = {};
+                const nullish = new Set(['', 'none', 'n/a', 'na', 'unknown', 'unsure', 'not sure', 'nil', 'no']);
+                for (const [k, v] of Object.entries(fields)) {
+                    if (v === null || v === undefined) continue;
+                    if (Array.isArray(v)) {
+                        const arr = v.map(x => (typeof x === 'string' ? x.trim() : x)).filter(x => x && x !== '' && !nullish.has(String(x).toLowerCase()));
+                        if (arr.length) cleaned[k] = arr;
+                    } else if (typeof v === 'string') {
+                        const s = v.trim();
+                        if (s && !nullish.has(s.toLowerCase())) cleaned[k] = s;
+                    } else if (typeof v === 'number') {
+                        cleaned[k] = v;
+                    } else if (typeof v === 'object') {
+                        // skip nested objects for now
+                        continue;
+                    }
+                }
+                if (Object.keys(cleaned).length === 0) return;
+
                 // Merge into conversations.clinical_data
                 const { data: existing, error: fetchErr } = await supabase
                     .from('conversations')
@@ -351,7 +417,27 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     .single();
                 if (fetchErr) console.warn('fetch clinical_data err', fetchErr?.message);
 
-                const updated = { ...(existing?.clinical_data || {}), ...fields };
+                const base = existing?.clinical_data || {};
+                const updated = { ...base };
+                for (const [k, v] of Object.entries(cleaned)) {
+                    const prev = base[k];
+                    const prevEmpty = prev === undefined || prev === null || (typeof prev === 'string' && prev.trim() === '') || (Array.isArray(prev) && prev.length === 0);
+                    if (prevEmpty) {
+                        updated[k] = v;
+                    } else {
+                        // If both exist and differ, prefer appending distinct values for arrays or keep existing string if incoming is substring
+                        if (Array.isArray(prev) && Array.isArray(v)) {
+                            const set = new Set([...prev, ...v]);
+                            updated[k] = Array.from(set);
+                        } else if (typeof prev === 'string' && typeof v === 'string') {
+                            if (!prev.toLowerCase().includes(v.toLowerCase())) {
+                                updated[k] = `${prev}; ${v}`;
+                            }
+                        } else {
+                            updated[k] = v;
+                        }
+                    }
+                }
                 const { error: updErr } = await supabase
                     .from('conversations')
                     .update({ clinical_data: updated, updated_at: new Date().toISOString() })
