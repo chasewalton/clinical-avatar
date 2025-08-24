@@ -265,6 +265,7 @@ fastify.register(async (fastify) => {
         let lastAssistantText = null;
         let lastAssistantAt = 0;
         let pendingClosing = false;
+        let assistantTranscript = '';
         // Coverage tracking to avoid premature closing
         let coveredPMH = false; // medical_history
         let coveredMeds = false; // current_medications
@@ -672,44 +673,59 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                         reviewText = `Let me briefly review what I have for your chart. Past medical history: ${pmh}. Current medications: ${meds}. Allergies: ${alg}.`;
                                     }
 
-                                    // If no structured review, fall back to transcript summary via OpenAI
+                                    // If no structured review, fall back to transcript summary via OpenAI (summary-only)
                                     let summaryText = '';
                                     if (!reviewText) {
                                         const { data: msgs, error: mErr } = await supabase
-                                        .from('messages')
-                                        .select('role, content, timestamp')
-                                        .eq('conversation_id', conversationId)
-                                        .order('timestamp', { ascending: true });
+                                            .from('messages')
+                                            .select('role, content, timestamp')
+                                            .eq('conversation_id', conversationId)
+                                            .order('timestamp', { ascending: true });
                                         let transcript = '';
                                         if (!mErr && Array.isArray(msgs)) {
                                             transcript = msgs.map(m => `${m.role}: ${m.content}`).join('\n');
                                         }
-                                        const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. Then end with: \"Is there anything else you'd like your provider to know before your visit?\"\n\nTRANSCRIPT:\n${transcript}`;
+                                        const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. IMPORTANT: Do NOT ask any follow-up question or include any closing line. Provide only the summary.\n\nTRANSCRIPT:\n${transcript}`;
                                         const res = await fetch('https://api.openai.com/v1/chat/completions', {
                                             method: 'POST',
                                             headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
                                             body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], temperature: 0.2 })
                                         });
                                         const ai = await res.json();
-                                        summaryText = ai?.choices?.[0]?.message?.content || "I'll summarize what you've shared so far, and before we finish, is there anything else you'd like your provider to know?";
+                                        summaryText = ai?.choices?.[0]?.message?.content || "Here's a brief summary of what you've shared.";
                                     }
 
-                                    const closingLine = " Is there anything else you'd like your provider to know before your visit?";
-                                    const finalText = (reviewText ? `${reviewText}${closingLine}` : summaryText);
+                                    const closingLine = "Is there anything else you'd like your provider to know before your visit?";
 
-                                    // Speak the summary now
+                                    // Speak in two steps: (1) summary/review, (2) closing question
                                     try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-                                    const summaryItem = {
+
+                                    const firstText = reviewText || summaryText;
+                                    if (firstText && firstText.trim()) {
+                                        const summaryItem = {
+                                            type: 'conversation.item.create',
+                                            item: {
+                                                type: 'message',
+                                                role: 'assistant',
+                                                content: [{ type: 'input_text', text: firstText }]
+                                            }
+                                        };
+                                        openAiWs.send(JSON.stringify(summaryItem));
+                                        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                                        saveMessage(conversationId, 'assistant', firstText, { summary: true, structured: !!reviewText });
+                                    }
+
+                                    const questionItem = {
                                         type: 'conversation.item.create',
                                         item: {
                                             type: 'message',
                                             role: 'assistant',
-                                            content: [{ type: 'input_text', text: finalText }]
+                                            content: [{ type: 'input_text', text: closingLine }]
                                         }
                                     };
-                                    openAiWs.send(JSON.stringify(summaryItem));
+                                    openAiWs.send(JSON.stringify(questionItem));
                                     openAiWs.send(JSON.stringify({ type: 'response.create' }));
-                                    saveMessage(conversationId, 'assistant', finalText, { summary: true, structured: !!reviewText });
+                                    saveMessage(conversationId, 'assistant', closingLine, { closing_question: true });
                                     // Do not end yet; wait for user confirmation in next turn
                                     
                                 } catch (e) {
@@ -745,6 +761,18 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     connection.send(JSON.stringify(audioDelta));
                 }
 
+                // Accumulate assistant transcript text to ensure full assistant lines are saved
+                if (response.type === 'response.audio_transcript.delta' && typeof response.delta === 'string') {
+                    assistantTranscript += response.delta;
+                }
+                if (response.type === 'response.audio_transcript.done') {
+                    const text = (assistantTranscript || '').trim();
+                    assistantTranscript = '';
+                    if (text && wsConversationId) {
+                        saveMessage(wsConversationId, 'assistant', text, { from: 'audio_transcript' });
+                    }
+                }
+
                 // Handle conversation item creation for better message tracking
                 if (response.type === 'conversation.item.created' && response.item) {
                     const conversationId = wsConversationId;
@@ -758,7 +786,10 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                 content = parts.join(' ').replace(/\s+/g, ' ').trim();
                             }
                         } catch {}
-                        if (!content) content = 'Assistant message';
+                        // If no concrete content found here, skip; we'll rely on audio_transcript.done handler
+                        if (!content) {
+                            return;
+                        }
 
                         // Enforce single-question per turn: if multiple '?', cancel and re-emit only first question
                         const qmCount = (content.match(/\?/g) || []).length;
