@@ -266,8 +266,6 @@ fastify.register(async (fastify) => {
         let lastAssistantAt = 0;
         let pendingClosing = false;
         let assistantTranscript = '';
-        // Manage two-step closing (summary then question)
-        let closingFlow = null; // { stage: 'summary_sent'|'question_sent', questionText: string }
         // Coverage tracking to avoid premature closing
         let coveredPMH = false; // medical_history
         let coveredMeds = false; // current_medications
@@ -502,97 +500,6 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         if (updated.allergies) coveredAllergies = true;
                     }
                 } catch {}
-
-                // If all required sections are now covered and we haven't initiated closing, trigger summary + closing question
-                try {
-                    if (!pendingClosing && coveredPMH && coveredMeds && coveredAllergies && wsConversationId) {
-                        pendingClosing = true;
-                        (async () => {
-                            try {
-                                // Prefer structured review from clinical_data
-                                const { data: convo, error: cErr } = await supabase
-                                    .from('conversations')
-                                    .select('clinical_data')
-                                    .eq('id', wsConversationId)
-                                    .single();
-                                let reviewText = '';
-                                const cd = (!cErr && convo && convo.clinical_data) ? convo.clinical_data : null;
-                                if (cd && (cd.medical_history || cd.current_medications || cd.allergies)) {
-                                    const pmh = cd.medical_history ? String(cd.medical_history) : 'not specified';
-                                    const meds = cd.current_medications ? String(cd.current_medications) : 'not specified';
-                                    const alg = cd.allergies ? String(cd.allergies) : 'not specified';
-                                    reviewText = `Let me briefly review what I have for your chart. Past medical history: ${pmh}. Current medications: ${meds}. Allergies: ${alg}.`;
-                                }
-
-                                let summaryText = '';
-                                if (!reviewText) {
-                                    const { data: msgs, error: mErr } = await supabase
-                                        .from('messages')
-                                        .select('role, content, timestamp')
-                                        .eq('conversation_id', wsConversationId)
-                                        .order('timestamp', { ascending: true });
-                                    let transcript = '';
-                                    if (!mErr && Array.isArray(msgs)) {
-                                        transcript = msgs.map(m => `${m.role}: ${m.content}`).join('\n');
-                                    }
-                                    const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. IMPORTANT: Do NOT ask any follow-up question or include any closing line. Provide only the summary.\n\nTRANSCRIPT:\n${transcript}`;
-                                    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-                                        method: 'POST',
-                                        headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], temperature: 0.2 })
-                                    });
-                                    const ai = await res.json();
-                                    summaryText = ai?.choices?.[0]?.message?.content || "Here's a brief summary of what you've shared.";
-                                }
-
-                                const firstText = reviewText || summaryText;
-                                const closingLine = "Is there anything else you'd like your provider to know before your visit?";
-                                try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-                                if (firstText && firstText.trim()) {
-                                    const summaryItem = {
-                                        type: 'conversation.item.create',
-                                        item: {
-                                            type: 'message',
-                                            role: 'assistant',
-                                            content: [{ type: 'input_text', text: firstText }]
-                                        }
-                                    };
-                                    openAiWs.send(JSON.stringify(summaryItem));
-                                    openAiWs.send(JSON.stringify({ type: 'response.create' }));
-                                    saveMessage(wsConversationId, 'assistant', firstText, { summary: true, structured: !!reviewText });
-                                    // Queue the closing question to follow when TTS finishes this summary
-                                    closingFlow = { stage: 'summary_sent', questionText: closingLine };
-                                } else {
-                                    // Fallback: synthesize a minimal summary from recent transcript
-                                    let fallback = '';
-                                    try {
-                                        const { data: msgs2 } = await supabase
-                                            .from('messages')
-                                            .select('role, content, timestamp')
-                                            .eq('conversation_id', wsConversationId)
-                                            .order('timestamp', { ascending: true });
-                                        const userLines = (msgs2 || []).filter(m => m.role === 'user').slice(-5).map(m => m.content).join(' ');
-                                        fallback = userLines ? `Here's a brief summary of what you've shared: ${userLines}` : "Here's a brief summary of what you've shared.";
-                                    } catch {}
-                                    const summaryItem = {
-                                        type: 'conversation.item.create',
-                                        item: {
-                                            type: 'message',
-                                            role: 'assistant',
-                                            content: [{ type: 'input_text', text: fallback }]
-                                        }
-                                    };
-                                    openAiWs.send(JSON.stringify(summaryItem));
-                                    openAiWs.send(JSON.stringify({ type: 'response.create' }));
-                                    saveMessage(wsConversationId, 'assistant', fallback, { summary: true, fallback: true });
-                                    closingFlow = { stage: 'summary_sent', questionText: closingLine };
-                                }
-                            } catch (e) {
-                                console.warn('Auto-closing summary failed:', e?.message);
-                            }
-                        })();
-                    }
-                } catch {}
             } catch (e) {
                 console.warn('extractClinical failed', e?.message);
             }
@@ -806,33 +713,19 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                         openAiWs.send(JSON.stringify(summaryItem));
                                         openAiWs.send(JSON.stringify({ type: 'response.create' }));
                                         saveMessage(conversationId, 'assistant', firstText, { summary: true, structured: !!reviewText });
-                                        // Queue the closing question to follow when TTS finishes this summary
-                                        closingFlow = { stage: 'summary_sent', questionText: closingLine };
-                                    } else {
-                                        // Fallback: synthesize a minimal summary from recent transcript
-                                        let fallback = '';
-                                        try {
-                                            const { data: msgs2 } = await supabase
-                                                .from('messages')
-                                                .select('role, content, timestamp')
-                                                .eq('conversation_id', conversationId)
-                                                .order('timestamp', { ascending: true });
-                                            const userLines = (msgs2 || []).filter(m => m.role === 'user').slice(-5).map(m => m.content).join(' ');
-                                            fallback = userLines ? `Here's a brief summary of what you've shared: ${userLines}` : "Here's a brief summary of what you've shared.";
-                                        } catch {}
-                                        const summaryItem = {
-                                            type: 'conversation.item.create',
-                                            item: {
-                                                type: 'message',
-                                                role: 'assistant',
-                                                content: [{ type: 'input_text', text: fallback }]
-                                            }
-                                        };
-                                        openAiWs.send(JSON.stringify(summaryItem));
-                                        openAiWs.send(JSON.stringify({ type: 'response.create' }));
-                                        saveMessage(conversationId, 'assistant', fallback, { summary: true, fallback: true });
-                                        closingFlow = { stage: 'summary_sent', questionText: closingLine };
                                     }
+
+                                    const questionItem = {
+                                        type: 'conversation.item.create',
+                                        item: {
+                                            type: 'message',
+                                            role: 'assistant',
+                                            content: [{ type: 'input_text', text: closingLine }]
+                                        }
+                                    };
+                                    openAiWs.send(JSON.stringify(questionItem));
+                                    openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                                    saveMessage(conversationId, 'assistant', closingLine, { closing_question: true });
                                     // Do not end yet; wait for user confirmation in next turn
                                     
                                 } catch (e) {
@@ -878,25 +771,6 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     if (text && wsConversationId) {
                         saveMessage(wsConversationId, 'assistant', text, { from: 'audio_transcript' });
                     }
-                }
-
-                // When a TTS response completes, if we queued a closing question, send it now
-                if (response.type === 'response.completed' && closingFlow && closingFlow.stage === 'summary_sent') {
-                    const question = closingFlow.questionText || "Is there anything else you'd like your provider to know before your visit?";
-                    const questionItem = {
-                        type: 'conversation.item.create',
-                        item: {
-                            type: 'message',
-                            role: 'assistant',
-                            content: [{ type: 'input_text', text: question }]
-                        }
-                    };
-                    try { openAiWs.send(JSON.stringify(questionItem)); } catch {}
-                    try { openAiWs.send(JSON.stringify({ type: 'response.create' })); } catch {}
-                    if (wsConversationId) {
-                        saveMessage(wsConversationId, 'assistant', question, { closing_question: true, queued_after_summary: true });
-                    }
-                    closingFlow.stage = 'question_sent';
                 }
 
                 // Handle conversation item creation for better message tracking
