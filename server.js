@@ -244,6 +244,12 @@ fastify.register(async (fastify) => {
         let greetingSent = false;
         let wantGreeting = false;
 
+        // Normalize conversation_id from the WS URL (avoid 'null' string)
+        const qs = req.url.split('?')[1] || '';
+        const paramConversationId = new URLSearchParams(qs).get('conversation_id');
+        const wsConversationId = (paramConversationId && paramConversationId !== 'null') ? paramConversationId : null;
+        console.log('WS conversation_id:', wsConversationId);
+
         const trySendGreeting = () => {
             if (!greetingSent && streamStarted && openAiWs.readyState === WebSocket.OPEN) {
                 // Create a conversation item first so the model has queued content
@@ -306,6 +312,36 @@ fastify.register(async (fastify) => {
         });
 
         // Listen for messages from the OpenAI WebSocket
+        // helper to persist a message directly to Supabase
+        const saveMessage = async (conversationId, role, content, metadata = {}) => {
+            if (!conversationId) {
+                console.warn('Skipping saveMessage: missing conversationId');
+                return;
+            }
+            if (!content || !content.trim()) {
+                console.warn('Skipping saveMessage: empty content');
+                return;
+            }
+            try {
+                const { error } = await supabase
+                    .from('messages')
+                    .insert({
+                        conversation_id: conversationId,
+                        role,
+                        content,
+                        metadata,
+                        timestamp: new Date().toISOString()
+                    });
+                if (error) {
+                    console.error('Supabase insert error (messages):', error, { role, len: content.length });
+                } else {
+                    console.log('Message saved', { conversation_id: conversationId, role, len: content.length });
+                }
+            } catch (e) {
+                console.error('Unexpected error saving message:', e);
+            }
+        };
+
         openAiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
@@ -341,25 +377,15 @@ fastify.register(async (fastify) => {
                         console.log(`Switched to questions voice: ${QUESTIONS_VOICE}`);
                     }
                     
-                    // Get conversation ID from URL params
-                    const conversationId = req.query.conversation_id;
+                    // Use normalized conversation ID from WS URL
+                    const conversationId = wsConversationId;
                     
-                    // Save user message via API endpoint
-                    if (response.transcript && conversationId) {
-                        fetch(`http://localhost:${PORT}/api/messages`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                conversation_id: conversationId,
-                                role: 'user',
-                                content: response.transcript,
-                                metadata: {
-                                    audio_duration: response.audio_end_ms - response.audio_start_ms,
-                                    timestamp: new Date().toISOString()
-                                }
-                            })
-                        }).catch(err => console.error('Error saving user message:', err));
-                        
+                    // Save user message directly
+                    if (response.transcript) {
+                        saveMessage(conversationId, 'user', response.transcript, {
+                            audio_duration: (response.audio_end_ms ?? 0) - (response.audio_start_ms ?? 0),
+                            timestamp: new Date().toISOString()
+                        });
                         // Extract clinical data from user response
                         fetch(`http://localhost:${PORT}/api/extract-clinical-data`, {
                             method: 'POST',
@@ -375,27 +401,18 @@ fastify.register(async (fastify) => {
                 if (response.type === 'response.done' && response.response) {
                     console.log('AI response completed');
                     
-                    // Get conversation ID from URL params
-                    const conversationId = req.query.conversation_id;
+                    // Use normalized conversation ID from WS URL
+                    const conversationId = wsConversationId;
                     
-                    // Save AI response via API endpoint
-                    if (conversationId) {
-                        const aiContent = response.response.output?.[0]?.content?.[0]?.transcript || 'AI response';
-                        fetch(`http://localhost:${PORT}/api/messages`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                conversation_id: conversationId,
-                                role: 'assistant',
-                                content: aiContent,
-                                metadata: {
-                                    response_id: response.response.id,
-                                    voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE,
-                                    timestamp: new Date().toISOString()
-                                }
-                            })
-                        }).catch(err => console.error('Error saving AI message:', err));
-                    }
+                    // Save AI response directly
+                    const aiContent = response.response?.output?.[0]?.content?.[0]?.transcript
+                        || response.response?.output?.[0]?.content?.[0]?.text
+                        || 'AI response';
+                    saveMessage(conversationId, 'assistant', aiContent, {
+                        response_id: response.response?.id,
+                        voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE,
+                        timestamp: new Date().toISOString()
+                    });
                 }
                 
                 // Handle conversation item creation for better message tracking
@@ -407,20 +424,11 @@ fastify.register(async (fastify) => {
                         const content = item.content?.[0]?.transcript || item.content?.[0]?.text || 'Assistant message';
                         console.log('Assistant message created:', content);
                         
-                        // Save assistant message
-                        fetch(`http://localhost:${PORT}/api/messages`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                conversation_id: conversationId,
-                                role: 'assistant',
-                                content: content,
-                                metadata: {
-                                    item_id: item.id,
-                                    voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
-                                }
-                            })
-                        }).catch(err => console.error('Error saving assistant message:', err));
+                        // Save assistant message directly
+                        saveMessage(conversationId, 'assistant', content, {
+                            item_id: item.id,
+                            voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
+                        });
                     }
                 }
                 
