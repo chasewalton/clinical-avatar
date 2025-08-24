@@ -38,7 +38,7 @@ const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant f
 IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M.U.S.C. we want to provide you with the best care at your upcoming appointment with Neurology. As M.U.S.C.'s Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. If that's alright, say \"Yes\" when you are ready to begin."
 Flow at start of call:
 1) Wait for the caller to consent by saying "Yes".
-2) Once consent is detected, begin intake: Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
+2) Once consent is detected, begin intake: Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "To start, can you tell me what symptoms or concerns led you to make this appointment?"
 3) If the caller does not say "Yes", do not proceed with intake. If asked questions before consent, gently remind them: "Please say \"Yes\" when you are ready to begin."
 
 Critical dialog rule:
@@ -60,6 +60,12 @@ Comprehensive intake topics to cover naturally (do not read as a checklist; weav
 - Social history: tobacco/vaping, alcohol, recreational drugs; occupation; living situation; exercise; diet
 - Gynecologic/OB history when appropriate: LMP, pregnancy status, contraception, relevant screenings
 - Immunizations and preventive care: recent vaccines, screenings (colonoscopy, mammogram, Pap)
+
+Do not end the intake until you have reasonably covered the caller's:
+- Past medical history (chronic conditions, prior hospitalizations)
+- Medications and allergies
+- Family and social history as relevant
+If the caller tries to end early, acknowledge and provide a concise summary, then ask if there's anything else their provider should know. Only conclude if they indicate they're done.
 - Review of systems: brief screen guided by the chief complaint
 
 Before closing, ask: "Is there anything else you'd like your provider to know before your visit?"
@@ -258,6 +264,11 @@ fastify.register(async (fastify) => {
         let endingCall = false;
         let lastAssistantText = null;
         let lastAssistantAt = 0;
+        let pendingClosing = false;
+        // Coverage tracking to avoid premature closing
+        let coveredPMH = false; // medical_history
+        let coveredMeds = false; // current_medications
+        let coveredAllergies = false; // allergies
 
         // Normalize conversation_id from the WS URL (avoid 'null' string)
         const qs = req.url.split('?')[1] || '';
@@ -312,12 +323,24 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                 const res = await fetch('https://api.openai.com/v1/chat/completions', {
                     method: 'POST',
                     headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: extractionPrompt }], temperature: 0.1 })
+                    body: JSON.stringify({
+                        model: 'gpt-4o-mini',
+                        messages: [{ role: 'user', content: extractionPrompt }],
+                        temperature: 0.0,
+                        response_format: { type: 'json_object' }
+                    })
                 });
                 const ai = await res.json();
                 const content = ai?.choices?.[0]?.message?.content || '';
                 let fields = {};
-                try { fields = JSON.parse(content); } catch {}
+                try {
+                    fields = JSON.parse(content);
+                } catch {
+                    const m = content.match(/[\{\[].*[\}\]]/s);
+                    if (m) {
+                        try { fields = JSON.parse(m[0]); } catch {}
+                    }
+                }
                 if (!fields || typeof fields !== 'object') return;
 
                 // Merge into conversations.clinical_data
@@ -333,7 +356,23 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     .from('conversations')
                     .update({ clinical_data: updated, updated_at: new Date().toISOString() })
                     .eq('id', conversationId);
-                if (updErr) console.warn('update clinical_data err', updErr?.message);
+                if (updErr) {
+                    console.warn('update clinical_data err', updErr?.message);
+                } else {
+                    console.log('clinical_data merged', {
+                        conversation_id: conversationId,
+                        keys: Object.keys(updated || {})
+                    });
+                }
+
+                // Update coverage flags based on merged fields
+                try {
+                    if (updated && typeof updated === 'object') {
+                        if (updated.medical_history) coveredPMH = true;
+                        if (updated.current_medications) coveredMeds = true;
+                        if (updated.allergies) coveredAllergies = true;
+                    }
+                } catch {}
             } catch (e) {
                 console.warn('extractClinical failed', e?.message);
             }
@@ -408,14 +447,32 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
             try {
                 const response = JSON.parse(data);
                 
+                if (response?.type && typeof response.type === 'string') {
+                    // Lightweight visibility for debugging event types
+                    if (Math.random() < 0.02) console.log('OpenAI event:', response.type);
+                }
+                
                 if (response.type === 'session.updated') {
                     console.log('Session updated successfully');
                     wantGreeting = true;
                     setTimeout(() => trySendGreeting(), 100);
                 }
-                // Save user utterances and trigger clinical extraction
+                // Save user utterances and trigger clinical extraction.
+                // Handle multiple possible OpenAI Realtime shapes for user transcripts.
+                let userSaid = null;
                 if (response.type === 'conversation.item.input_audio_transcription.completed') {
-                    const text = (response.transcript || '').trim();
+                    userSaid = (response.transcript || '').trim();
+                }
+                if (response.type === 'conversation.item.created' && response.item?.type === 'message' && response.item?.role === 'user') {
+                    const parts = Array.isArray(response.item.content) ? response.item.content : [];
+                    const textPart = parts.find(p => p?.type === 'output_text' || p?.type === 'input_text' || p?.type === 'text');
+                    if (textPart?.text) userSaid = (textPart.text || '').trim();
+                }
+                if (typeof response.transcript === 'string' && response.type?.includes('transcription') && !userSaid) {
+                    userSaid = (response.transcript || '').trim();
+                }
+                if (userSaid) {
+                    const text = userSaid;
                     if (text) {
                         console.log('User said:', text);
                         const conversationId = wsConversationId;
@@ -423,8 +480,30 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         // Kick off extraction asynchronously
                         extractClinical(conversationId, text);
 
-                        // Detect goodbye/exit intent and provide summary + closing prompt
-                        if (/(goodbye|bye|have to go|hang up|end the call|gotta go)/i.test(text)) {
+                        // Detect goodbye/exit intent and provide summary + closing prompt (but do NOT hang up yet)
+                        if (!pendingClosing && /(goodbye|bye\b|have to go|hang up|end the call|gotta go|that is all|that's all|nothing else|no, that's it)/i.test(text)) {
+                            // If required sections are not covered, ask for what's missing instead of closing
+                            const missing = [];
+                            if (!coveredPMH) missing.push('your past medical history, like any chronic conditions or prior hospitalizations');
+                            if (!coveredMeds) missing.push('the medications or supplements you currently take');
+                            if (!coveredAllergies) missing.push('any medication or other allergies');
+                            if (missing.length > 0) {
+                                const followUp = `I understand we may need to wrap up soon. Before we do, I still need ${missing.join(' and ')} to make sure your provider has what they need. Could you share that now?`;
+                                try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                                const askItem = {
+                                    type: 'conversation.item.create',
+                                    item: {
+                                        type: 'message',
+                                        role: 'assistant',
+                                        content: [{ type: 'input_text', text: followUp }]
+                                    }
+                                };
+                                openAiWs.send(JSON.stringify(askItem));
+                                openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                                saveMessage(conversationId, 'assistant', followUp, { coverage_gate: true });
+                                // Do not set pendingClosing; continue intake
+                            } else {
+                                pendingClosing = true;
                             (async () => {
                                 try {
                                     // Build a brief summary from existing messages
@@ -459,18 +538,29 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                     openAiWs.send(JSON.stringify(summaryItem));
                                     openAiWs.send(JSON.stringify({ type: 'response.create' }));
                                     saveMessage(conversationId, 'assistant', summaryText, { summary: true });
-
-                                    // Mark conversation completed and hang up shortly after
-                                    await supabase
-                                        .from('conversations')
-                                        .update({ status: 'completed', ended_at: new Date().toISOString() })
-                                        .eq('id', conversationId);
-                                    setTimeout(() => { try { connection.close(); } catch {} }, 2500);
+                                    // Do not end yet; wait for user confirmation in next turn
+                                    
                                 } catch (e) {
                                     console.warn('Failed to produce end-of-call summary:', e?.message);
                                 }
                             })();
+                            }
                         }
+                    }
+                }
+                // If we already prompted with the closing question, end only when user confirms no more info
+                if (pendingClosing && response.type === 'conversation.item.input_audio_transcription.completed') {
+                    const said = (response.transcript || '').trim().toLowerCase();
+                    if (/(no|that's all|nothing else|nope|that is all|all good)/i.test(said)) {
+                        (async () => {
+                            try {
+                                await supabase
+                                    .from('conversations')
+                                    .update({ status: 'completed', ended_at: new Date().toISOString() })
+                                    .eq('id', wsConversationId);
+                                setTimeout(() => { try { connection.close(); } catch {} }, 1500);
+                            } catch {}
+                        })();
                     }
                 }
                 
