@@ -46,6 +46,10 @@ Critical dialog rule:
 - Never bundle multiple questions in the same message (e.g., do not ask about severity and duration and history together).
 - Keep each question short and let the caller answer before asking the next question.
 
+Empathy and validation:
+- Use brief, genuine reflections and validations before your next question.
+- Examples: "I’m sorry you’re going through that.", "That sounds really uncomfortable.", "Thank you for sharing that; it’s helpful for your care."
+
 Comprehensive intake topics to cover naturally (do not read as a checklist; weave them into conversation based on context):
 - Chief complaint onset, duration, severity, triggers/relievers, associated symptoms
 - Past medical history: chronic conditions (e.g., hypertension, diabetes, asthma), prior hospitalizations, major illnesses
@@ -287,6 +291,53 @@ fastify.register(async (fastify) => {
                 console.log('Initial greeting sent');
             }
         };
+
+        // Extract clinical fields from a user's utterance and merge into conversations.clinical_data
+        const extractClinical = async (conversationId, text) => {
+            try {
+                if (!text || !text.trim() || !conversationId) return;
+                const extractionPrompt = `Extract clinical information from this patient response: "${text}"
+
+Identify and extract as a flat JSON object of key:value pairs only for fields that are mentioned (omit others):
+- chief_complaint
+- symptoms
+- medical_history
+- current_medications
+- allergies
+- pain_level
+- duration
+- family_history
+- social_history`;
+
+                const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: extractionPrompt }], temperature: 0.1 })
+                });
+                const ai = await res.json();
+                const content = ai?.choices?.[0]?.message?.content || '';
+                let fields = {};
+                try { fields = JSON.parse(content); } catch {}
+                if (!fields || typeof fields !== 'object') return;
+
+                // Merge into conversations.clinical_data
+                const { data: existing, error: fetchErr } = await supabase
+                    .from('conversations')
+                    .select('clinical_data')
+                    .eq('id', conversationId)
+                    .single();
+                if (fetchErr) console.warn('fetch clinical_data err', fetchErr?.message);
+
+                const updated = { ...(existing?.clinical_data || {}), ...fields };
+                const { error: updErr } = await supabase
+                    .from('conversations')
+                    .update({ clinical_data: updated, updated_at: new Date().toISOString() })
+                    .eq('id', conversationId);
+                if (updErr) console.warn('update clinical_data err', updErr?.message);
+            } catch (e) {
+                console.warn('extractClinical failed', e?.message);
+            }
+        };
         
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
@@ -361,6 +412,66 @@ fastify.register(async (fastify) => {
                     console.log('Session updated successfully');
                     wantGreeting = true;
                     setTimeout(() => trySendGreeting(), 100);
+                }
+                // Save user utterances and trigger clinical extraction
+                if (response.type === 'conversation.item.input_audio_transcription.completed') {
+                    const text = (response.transcript || '').trim();
+                    if (text) {
+                        console.log('User said:', text);
+                        const conversationId = wsConversationId;
+                        saveMessage(conversationId, 'user', text, { transcript: true, timestamp: new Date().toISOString() });
+                        // Kick off extraction asynchronously
+                        extractClinical(conversationId, text);
+
+                        // Detect goodbye/exit intent and provide summary + closing prompt
+                        if (/(goodbye|bye|have to go|hang up|end the call|gotta go)/i.test(text)) {
+                            (async () => {
+                                try {
+                                    // Build a brief summary from existing messages
+                                    const { data: msgs, error: mErr } = await supabase
+                                        .from('messages')
+                                        .select('role, content, timestamp')
+                                        .eq('conversation_id', conversationId)
+                                        .order('timestamp', { ascending: true });
+                                    let transcript = '';
+                                    if (!mErr && Array.isArray(msgs)) {
+                                        transcript = msgs.map(m => `${m.role}: ${m.content}`).join('\n');
+                                    }
+                                    const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. Then end with: \"Is there anything else you'd like your provider to know before your visit?\"\n\nTRANSCRIPT:\n${transcript}`;
+                                    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                                        method: 'POST',
+                                        headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], temperature: 0.2 })
+                                    });
+                                    const ai = await res.json();
+                                    const summaryText = ai?.choices?.[0]?.message?.content || "I'll summarize what you've shared so far, and before we finish, is there anything else you'd like your provider to know?";
+
+                                    // Speak the summary now
+                                    try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                                    const summaryItem = {
+                                        type: 'conversation.item.create',
+                                        item: {
+                                            type: 'message',
+                                            role: 'assistant',
+                                            content: [{ type: 'input_text', text: summaryText }]
+                                        }
+                                    };
+                                    openAiWs.send(JSON.stringify(summaryItem));
+                                    openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                                    saveMessage(conversationId, 'assistant', summaryText, { summary: true });
+
+                                    // Mark conversation completed and hang up shortly after
+                                    await supabase
+                                        .from('conversations')
+                                        .update({ status: 'completed', ended_at: new Date().toISOString() })
+                                        .eq('id', conversationId);
+                                    setTimeout(() => { try { connection.close(); } catch {} }, 2500);
+                                } catch (e) {
+                                    console.warn('Failed to produce end-of-call summary:', e?.message);
+                                }
+                            })();
+                        }
+                    }
                 }
                 
                 if (response.type === 'response.audio.delta' && response.delta) {
