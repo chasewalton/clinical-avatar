@@ -35,7 +35,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const INTRO_VOICE = 'alloy';
 const QUESTIONS_VOICE = 'alloy';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
-IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at MUSC we want to provide you with the best care at your upcoming appointment with Neurology. We'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. I'd like to connect you to MUSC's Clinical Assistant, if that's alright? Say \"Yes\" when you are ready to begin."
+IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at MUSC we want to provide you with the best care at your upcoming appointment with Neurology. As MUSC's Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. If that's alright, say \"Yes\" when you are ready to begin."
 Flow at start of call:
 1) Wait for the caller to consent by saying "Yes".
 2) Once consent is detected, begin intake: Introduce yourself as the MUSC Clinics AI assistant and proceed with natural, conversational intake questions. Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
@@ -245,6 +245,10 @@ fastify.register(async (fastify) => {
         let streamStarted = false;
         let greetingSent = false;
         let wantGreeting = false;
+        let consentGiven = false;
+        let endingCall = false;
+        let lastAssistantText = null;
+        let lastAssistantAt = 0;
 
         // Normalize conversation_id from the WS URL (avoid 'null' string)
         const qs = req.url.split('?')[1] || '';
@@ -298,8 +302,8 @@ fastify.register(async (fastify) => {
                     turn_detection: {
                         type: 'server_vad',
                         threshold: 0.5,
-                        prefix_padding_ms: 300,
-                        silence_duration_ms: 200
+                        prefix_padding_ms: 500,
+                        silence_duration_ms: 600
                     }
                 }
             };
@@ -362,75 +366,28 @@ fastify.register(async (fastify) => {
                     };
                     connection.send(JSON.stringify(audioDelta));
                 }
-                
-                if (response.type === 'conversation.item.input_audio_transcription.completed') {
-                    console.log('User said:', response.transcript);
-                    
-                    // Switch to questions voice after first user input
-                    if (isIntroPhase) {
-                        isIntroPhase = false;
-                        const voiceUpdate = {
-                            type: 'session.update',
-                            session: {
-                                voice: QUESTIONS_VOICE
-                            }
-                        };
-                        openAiWs.send(JSON.stringify(voiceUpdate));
-                        console.log(`Switched to questions voice: ${QUESTIONS_VOICE}`);
-                    }
-                    
-                    // Use normalized conversation ID from WS URL
-                    const conversationId = wsConversationId;
-                    
-                    // Save user message directly
-                    if (response.transcript) {
-                        saveMessage(conversationId, 'user', response.transcript, {
-                            audio_duration: (response.audio_end_ms ?? 0) - (response.audio_start_ms ?? 0),
-                            timestamp: new Date().toISOString()
-                        });
-                        // Extract clinical data from user response
-                        fetch(`http://localhost:${PORT}/api/extract-clinical-data`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                conversation_id: conversationId,
-                                text: response.transcript
-                            })
-                        }).catch(err => console.error('Error extracting clinical data:', err));
-                    }
-                }
-                
-                if (response.type === 'response.done' && response.response) {
-                    console.log('AI response completed');
-                    
-                    // Use normalized conversation ID from WS URL
-                    const conversationId = wsConversationId;
-                    
-                    // Save AI response directly
-                    const aiContent = response.response?.output?.[0]?.content?.[0]?.transcript
-                        || response.response?.output?.[0]?.content?.[0]?.text
-                        || 'AI response';
-                    saveMessage(conversationId, 'assistant', aiContent, {
-                        response_id: response.response?.id,
-                        voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE,
-                        timestamp: new Date().toISOString()
-                    });
-                }
-                
+
                 // Handle conversation item creation for better message tracking
                 if (response.type === 'conversation.item.created' && response.item) {
-                    const conversationId = req.query.conversation_id;
+                    const conversationId = wsConversationId;
                     const item = response.item;
                     
                     if (item.type === 'message' && item.role === 'assistant' && conversationId) {
                         const content = item.content?.[0]?.transcript || item.content?.[0]?.text || 'Assistant message';
                         console.log('Assistant message created:', content);
-                        
-                        // Save assistant message directly
-                        saveMessage(conversationId, 'assistant', content, {
-                            item_id: item.id,
-                            voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
-                        });
+                        // Debounce duplicate assistant lines within 5s
+                        const now = Date.now();
+                        if (!(content && content === lastAssistantText && (now - lastAssistantAt) < 5000)) {
+                            lastAssistantText = content;
+                            lastAssistantAt = now;
+                            // Save assistant message directly
+                            saveMessage(conversationId, 'assistant', content, {
+                                item_id: item.id,
+                                voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
+                            });
+                        } else {
+                            console.log('Skipping duplicate assistant line (created)');
+                        }
                     }
                 }
                 
