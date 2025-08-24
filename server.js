@@ -673,7 +673,7 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                         reviewText = `Let me briefly review what I have for your chart. Past medical history: ${pmh}. Current medications: ${meds}. Allergies: ${alg}.`;
                                     }
 
-                                    // If no structured review, fall back to transcript summary via OpenAI (summary-only)
+                                    // If there are no structured review, fall back to transcript summary via OpenAI (summary-only)
                                     let summaryText = '';
                                     if (!reviewText) {
                                         const { data: msgs, error: mErr } = await supabase
