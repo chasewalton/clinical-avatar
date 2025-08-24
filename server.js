@@ -35,7 +35,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const INTRO_VOICE = 'alloy';
 const QUESTIONS_VOICE = 'alloy';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for M.U.S.C. Clinics.
-IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M.U.S.C. we want to provide you with the best care at your upcoming appointment with Neurology. As M.U.S.C.'s Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. If that's alright, say \"Yes\" when you are ready to begin."
+IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M.U.S.C. we want to provide you with the best care at your upcoming appointment with Neurology. As M.U.S.C.'s Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. It will take about 5 minutes. If that's alright, say \"Yes\" when you are ready to begin."
 Flow at start of call:
 1) Wait for the caller to consent by saying "Yes".
 2) Once consent is detected, begin intake: Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "To start, can you tell me what symptoms or concerns led you to make this appointment?"
@@ -391,15 +391,51 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
 
                 // Remove null/empty/unknown values and normalize strings
                 const cleaned = {};
-                const nullish = new Set(['', 'none', 'n/a', 'na', 'unknown', 'unsure', 'not sure', 'nil', 'no']);
+                const nullish = new Set(['', 'none', 'n/a', 'na', 'unknown', 'unsure', 'not sure', 'nil']);
+                const fillerPhrases = [
+                    'yes', 'yep', 'yeah', 'ok', 'okay', 'so', 'yet', 'um', 'uh',
+                    "it's gonna", 'pretty severe', 'gonna', 'kind of', 'sort of'
+                ];
+                const isNullish = (s) => nullish.has(String(s).toLowerCase());
+                const splitParts = (s) => (s || '')
+                    .split(/[,;]+|\band\b/gi)
+                    .map(t => t.trim())
+                    .filter(t => t && !isNullish(t) && !fillerPhrases.includes(t.toLowerCase()));
+                const pickInformative = (arr) => {
+                    if (!arr.length) return '';
+                    // Prefer parts that include medical/time words or are longest
+                    const timeRe = /(hour|day|week|month|year|since|ago|yesterday|today)/i;
+                    const scored = arr.map(t => ({
+                        t,
+                        score: (timeRe.test(t) ? 5 : 0) + Math.min(t.replace(/[^a-z]/gi, '').length, 60)
+                    }));
+                    scored.sort((a, b) => b.score - a.score);
+                    return scored[0].t;
+                };
+
                 for (const [k, v] of Object.entries(fields)) {
                     if (v === null || v === undefined) continue;
                     if (Array.isArray(v)) {
-                        const arr = v.map(x => (typeof x === 'string' ? x.trim() : x)).filter(x => x && x !== '' && !nullish.has(String(x).toLowerCase()));
-                        if (arr.length) cleaned[k] = arr;
+                        const arr = v
+                            .map(x => (typeof x === 'string' ? x.trim() : x))
+                            .filter(x => x && x !== '' && !isNullish(x) && !fillerPhrases.includes(String(x).toLowerCase()));
+                        if (arr.length) cleaned[k] = Array.from(new Set(arr));
                     } else if (typeof v === 'string') {
                         const s = v.trim();
-                        if (s && !nullish.has(s.toLowerCase())) cleaned[k] = s;
+                        if (!s || isNullish(s)) continue;
+                        const parts = splitParts(s);
+                        let val = '';
+                        if (k === 'duration') {
+                            val = pickInformative(parts.length ? parts : [s]);
+                        } else if (k === 'chief_complaint') {
+                            // pick the most informative complaint
+                            val = pickInformative(parts.length ? parts : [s]);
+                        } else {
+                            // keep up to 3 distinct values
+                            const uniq = Array.from(new Set(parts.length ? parts : [s]));
+                            val = uniq.slice(0, 3).join(', ');
+                        }
+                        if (val) cleaned[k] = val;
                     } else if (typeof v === 'number') {
                         cleaned[k] = v;
                     } else if (typeof v === 'object') {
@@ -425,13 +461,17 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     if (prevEmpty) {
                         updated[k] = v;
                     } else {
-                        // If both exist and differ, prefer appending distinct values for arrays or keep existing string if incoming is substring
                         if (Array.isArray(prev) && Array.isArray(v)) {
                             const set = new Set([...prev, ...v]);
                             updated[k] = Array.from(set);
                         } else if (typeof prev === 'string' && typeof v === 'string') {
-                            if (!prev.toLowerCase().includes(v.toLowerCase())) {
-                                updated[k] = `${prev}; ${v}`;
+                            // Prefer the more informative string; if distinct and longer, replace; else keep prev
+                            const prevLen = prev.replace(/[^a-z]/gi, '').length;
+                            const vLen = v.replace(/[^a-z]/gi, '').length;
+                            if (vLen > prevLen && !v.toLowerCase().includes(prev.toLowerCase())) {
+                                updated[k] = v;
+                            } else {
+                                updated[k] = prev;
                             }
                         } else {
                             updated[k] = v;
@@ -592,24 +632,45 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                 pendingClosing = true;
                             (async () => {
                                 try {
-                                    // Build a brief summary from existing messages
-                                    const { data: msgs, error: mErr } = await supabase
+                                    // Build structured review from clinical_data when available
+                                    const { data: convo, error: cErr } = await supabase
+                                        .from('conversations')
+                                        .select('clinical_data')
+                                        .eq('id', conversationId)
+                                        .single();
+                                    let reviewText = '';
+                                    const cd = (!cErr && convo && convo.clinical_data) ? convo.clinical_data : null;
+                                    if (cd && (cd.medical_history || cd.current_medications || cd.allergies)) {
+                                        const pmh = cd.medical_history ? String(cd.medical_history) : 'not specified';
+                                        const meds = cd.current_medications ? String(cd.current_medications) : 'not specified';
+                                        const alg = cd.allergies ? String(cd.allergies) : 'not specified';
+                                        reviewText = `Let me briefly review what I have for your chart. Past medical history: ${pmh}. Current medications: ${meds}. Allergies: ${alg}.`;
+                                    }
+
+                                    // If no structured review, fall back to transcript summary via OpenAI
+                                    let summaryText = '';
+                                    if (!reviewText) {
+                                        const { data: msgs, error: mErr } = await supabase
                                         .from('messages')
                                         .select('role, content, timestamp')
                                         .eq('conversation_id', conversationId)
                                         .order('timestamp', { ascending: true });
-                                    let transcript = '';
-                                    if (!mErr && Array.isArray(msgs)) {
-                                        transcript = msgs.map(m => `${m.role}: ${m.content}`).join('\n');
+                                        let transcript = '';
+                                        if (!mErr && Array.isArray(msgs)) {
+                                            transcript = msgs.map(m => `${m.role}: ${m.content}`).join('\n');
+                                        }
+                                        const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. Then end with: \"Is there anything else you'd like your provider to know before your visit?\"\n\nTRANSCRIPT:\n${transcript}`;
+                                        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                                            method: 'POST',
+                                            headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], temperature: 0.2 })
+                                        });
+                                        const ai = await res.json();
+                                        summaryText = ai?.choices?.[0]?.message?.content || "I'll summarize what you've shared so far, and before we finish, is there anything else you'd like your provider to know?";
                                     }
-                                    const prompt = `Summarize the patient's history so far in 3-5 concise, empathetic sentences based on this transcript. Then end with: \"Is there anything else you'd like your provider to know before your visit?\"\n\nTRANSCRIPT:\n${transcript}`;
-                                    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-                                        method: 'POST',
-                                        headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: prompt }], temperature: 0.2 })
-                                    });
-                                    const ai = await res.json();
-                                    const summaryText = ai?.choices?.[0]?.message?.content || "I'll summarize what you've shared so far, and before we finish, is there anything else you'd like your provider to know?";
+
+                                    const closingLine = " Is there anything else you'd like your provider to know before your visit?";
+                                    const finalText = (reviewText ? `${reviewText}${closingLine}` : summaryText);
 
                                     // Speak the summary now
                                     try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
@@ -618,12 +679,12 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                                         item: {
                                             type: 'message',
                                             role: 'assistant',
-                                            content: [{ type: 'input_text', text: summaryText }]
+                                            content: [{ type: 'input_text', text: finalText }]
                                         }
                                     };
                                     openAiWs.send(JSON.stringify(summaryItem));
                                     openAiWs.send(JSON.stringify({ type: 'response.create' }));
-                                    saveMessage(conversationId, 'assistant', summaryText, { summary: true });
+                                    saveMessage(conversationId, 'assistant', finalText, { summary: true, structured: !!reviewText });
                                     // Do not end yet; wait for user confirmation in next turn
                                     
                                 } catch (e) {
