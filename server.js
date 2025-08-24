@@ -563,6 +563,31 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     console.error('Supabase insert error (messages):', error, { role, len: content.length });
                 } else {
                     console.log('Message saved', { conversation_id: conversationId, role, len: content.length });
+                    // Append to conversations.summary as running transcript
+                    try {
+                        const prefix = role === 'user' ? 'User' : (role === 'assistant' ? 'Assistant' : 'System');
+                        const line = `${prefix}: ${content}`;
+                        // Fetch existing summary, append new line, then update
+                        const { data: convo, error: selErr } = await supabase
+                            .from('conversations')
+                            .select('summary')
+                            .eq('id', conversationId)
+                            .single();
+                        if (selErr) {
+                            console.warn('Failed to read existing summary:', selErr?.message);
+                        }
+                        const current = (convo && typeof convo.summary === 'string') ? convo.summary : '';
+                        const updatedSummary = current ? `${current}\n${line}` : line;
+                        const { error: upErr } = await supabase
+                            .from('conversations')
+                            .update({ summary: updatedSummary, updated_at: new Date().toISOString() })
+                            .eq('id', conversationId);
+                        if (upErr) {
+                            console.warn('Failed to append to summary:', upErr?.message);
+                        }
+                    } catch (e) {
+                        console.warn('Error appending to running summary:', e?.message);
+                    }
                 }
             } catch (e) {
                 console.error('Unexpected error saving message:', e);
@@ -1007,5 +1032,6 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     const baseUrl = PUBLIC_BASE_URL || `http://localhost:${PORT}`;
     console.log(`Server running on ${baseUrl}`);
     console.log(`WebSocket server running on same origin`);
-    console.log(`Twilio webhook URL: ${baseUrl.replace('http', 'https')}/webhook/voice`);
+    const webhookBase = baseUrl.startsWith('http://') ? baseUrl.replace('http://', 'https://') : baseUrl;
+    console.log(`Twilio webhook URL: ${webhookBase}/webhook/voice`);
 });
