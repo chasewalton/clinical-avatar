@@ -34,12 +34,17 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // Constants
 const INTRO_VOICE = 'alloy';
 const QUESTIONS_VOICE = 'alloy';
-const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for MUSC Clinics.
-IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at MUSC we want to provide you with the best care at your upcoming appointment with Neurology. As MUSC's Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. If that's alright, say \"Yes\" when you are ready to begin."
+const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for M.U.S.C. Clinics.
+IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M.U.S.C. we want to provide you with the best care at your upcoming appointment with Neurology. As M.U.S.C.'s Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. If that's alright, say \"Yes\" when you are ready to begin."
 Flow at start of call:
 1) Wait for the caller to consent by saying "Yes".
-2) Once consent is detected, begin intake: Introduce yourself as the MUSC Clinics AI assistant and proceed with natural, conversational intake questions. Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
+2) Once consent is detected, begin intake: Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "Can you tell me what symptoms or concerns led you to make this appointment?"
 3) If the caller does not say "Yes", do not proceed with intake. If asked questions before consent, gently remind them: "Please say \"Yes\" when you are ready to begin."
+
+Critical dialog rule:
+- Ask exactly ONE question per turn.
+- Never bundle multiple questions in the same message (e.g., do not ask about severity and duration and history together).
+- Keep each question short and let the caller answer before asking the next question.
 
 Comprehensive intake topics to cover naturally (do not read as a checklist; weave them into conversation based on context):
 - Chief complaint onset, duration, severity, triggers/relievers, associated symptoms
@@ -267,7 +272,7 @@ fastify.register(async (fastify) => {
                         content: [
                             {
                                 type: 'input_text',
-                                text: "Hi, I am connecting you to MUSC's Clinical Assistant. Say 'Yes' when you are ready to begin intake."
+                                text: "Hi, I am connecting you to M.U.S.C.'s Clinical Assistant. Say 'Yes' when you are ready to begin intake."
                             }
                         ]
                     }
@@ -371,27 +376,39 @@ fastify.register(async (fastify) => {
                 if (response.type === 'conversation.item.created' && response.item) {
                     const conversationId = wsConversationId;
                     const item = response.item;
-                    
                     if (item.type === 'message' && item.role === 'assistant' && conversationId) {
-                        const content = item.content?.[0]?.transcript || item.content?.[0]?.text || 'Assistant message';
-                        console.log('Assistant message created:', content);
-                        // Debounce duplicate assistant lines within 5s
-                        const now = Date.now();
-                        if (!(content && content === lastAssistantText && (now - lastAssistantAt) < 5000)) {
-                            lastAssistantText = content;
-                            lastAssistantAt = now;
-                            // Save assistant message directly
-                            saveMessage(conversationId, 'assistant', content, {
-                                item_id: item.id,
-                                voice_used: isIntroPhase ? INTRO_VOICE : QUESTIONS_VOICE
-                            });
+                        // Normalize content string from possible transcript/text segments
+                        let content = '';
+                        try {
+                            if (Array.isArray(item.content) && item.content.length) {
+                                const parts = item.content.map(c => c?.transcript || c?.text || '').filter(Boolean);
+                                content = parts.join(' ').replace(/\s+/g, ' ').trim();
+                            }
+                        } catch {}
+                        if (!content) content = 'Assistant message';
+
+                        // Enforce single-question per turn: if multiple '?', cancel and re-emit only first question
+                        const qmCount = (content.match(/\?/g) || []).length;
+                        if (qmCount > 1) {
+                            const firstQ = content.split('?')[0].trim() + '?';
+                            console.log('Enforcing single-question output; cancelling multi-question response');
+                            try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                            const singleItem = {
+                                type: 'conversation.item.create',
+                                item: {
+                                    type: 'message',
+                                    role: 'assistant',
+                                    content: [{ type: 'input_text', text: firstQ }]
+                                }
+                            };
+                            openAiWs.send(JSON.stringify(singleItem));
+                            openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                            saveMessage(conversationId, 'assistant', firstQ, { item_id: item.id });
                         } else {
-                            console.log('Skipping duplicate assistant line (created)');
+                            saveMessage(conversationId, 'assistant', content, { item_id: item.id });
                         }
                     }
                 }
-                
-                
             } catch (error) {
                 console.error('Error processing OpenAI message:', error);
             }
