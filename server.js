@@ -219,7 +219,9 @@ fastify.all('/webhook/voice', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
                               <Connect>
-                                  <Stream url="wss://${request.headers.host}/coral-stream?conversation_id=${conversationId}" />
+                                  <Stream url="wss://${request.headers.host}/coral-stream">
+                                      <Parameter name="conversation_id" value="${conversationId}" />
+                                  </Stream>
                               </Connect>
                           </Response>`;
     
@@ -247,8 +249,8 @@ fastify.register(async (fastify) => {
         // Normalize conversation_id from the WS URL (avoid 'null' string)
         const qs = req.url.split('?')[1] || '';
         const paramConversationId = new URLSearchParams(qs).get('conversation_id');
-        const wsConversationId = (paramConversationId && paramConversationId !== 'null') ? paramConversationId : null;
-        console.log('WS conversation_id:', wsConversationId);
+        let wsConversationId = (paramConversationId && paramConversationId !== 'null') ? paramConversationId : null;
+        console.log('WS conversation_id (query fallback):', wsConversationId);
 
         const trySendGreeting = () => {
             if (!greetingSent && streamStarted && openAiWs.readyState === WebSocket.OPEN) {
@@ -456,6 +458,12 @@ fastify.register(async (fastify) => {
                     case 'start':
                         streamSid = data.start.streamSid;
                         streamStarted = true;
+                        // Prefer Twilio customParameters for conversation_id
+                        const cp = data.start?.customParameters || {};
+                        if (cp.conversation_id && cp.conversation_id !== 'null') {
+                            wsConversationId = cp.conversation_id;
+                            console.log('WS conversation_id (from customParameters):', wsConversationId);
+                        }
                         console.log('Incoming stream has started', streamSid);
                         trySendGreeting();
                         break;
