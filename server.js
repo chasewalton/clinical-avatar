@@ -35,7 +35,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const INTRO_VOICE = 'alloy';
 const QUESTIONS_VOICE = 'alloy';
 const SYSTEM_MESSAGE = `You are a warm, empathetic AI medical intake assistant for M.U.S.C. Clinics.
-IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M.U.S.C. we want to provide you with the best care at your upcoming appointment with Neurology. As M.U.S.C.'s Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. It will take about 5 minutes. If that's alright, say \"Yes\" when you are ready to begin."
+Pronunciation rule: Always say "M-U-S-C" as separate letters, or say "Medical University of South Carolina" on first reference. Never pronounce it like the word "musk".
+IMPORTANT: As soon as the call connects, immediately greet the caller without waiting. Start with: "Hi, at M-U-S-C (Medical University of South Carolina) we want to provide you with the best care at your upcoming appointment with Neurology. As M-U-S-C's Clinical Assistant, I'd like to collect some basic information before your upcoming appointment so that you can spend more time talking to your specialist about what's important to you. It will take about 5 minutes. If that's alright, say \"Yes\" when you are ready to begin."
 Flow at start of call:
 1) Wait for the caller to consent by saying "Yes".
 2) Once consent is detected, begin intake: Be caring, professional, and easy to understand. Speak at a comfortable pace. Start with, "To start, can you tell me what symptoms or concerns led you to make this appointment?"
@@ -264,6 +265,9 @@ fastify.register(async (fastify) => {
         let endingCall = false;
         let lastAssistantText = null;
         let lastAssistantAt = 0;
+        let lastUserAt = 0;
+        let nudgeTimer = null;
+        let nudgeSentForTurn = false;
         let pendingClosing = false;
         let assistantTranscript = '';
         // Coverage tracking to avoid premature closing
@@ -288,7 +292,7 @@ fastify.register(async (fastify) => {
                         content: [
                             {
                                 type: 'input_text',
-                                text: "Hi, I am connecting you to M.U.S.C.'s Clinical Assistant. Say 'Yes' when you are ready to begin intake."
+                                text: "Hi, I am connecting you to M-U-S-C's (Medical University of South Carolina) Clinical Assistant. Say 'Yes' when you are ready to begin intake."
                             }
                         ]
                     }
@@ -302,6 +306,26 @@ fastify.register(async (fastify) => {
                 greetingSent = true;
                 console.log('Initial greeting sent');
             }
+        };
+
+        // Send a brief acknowledgment and a next-step question if no response is generated
+        const sendNoDeadAirNudge = () => {
+            if (nudgeSentForTurn || pendingClosing || openAiWs.readyState !== WebSocket.OPEN) return;
+            try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+            const nudgeText = "Thanks, I’ve noted that. Could you tell me about any medication or other allergies you have, and what reactions you’ve had?";
+            const nudgeItem = {
+                type: 'conversation.item.create',
+                item: {
+                    type: 'message',
+                    role: 'assistant',
+                    content: [{ type: 'input_text', text: nudgeText }]
+                }
+            };
+            openAiWs.send(JSON.stringify(nudgeItem));
+            openAiWs.send(JSON.stringify({ type: 'response.create' }));
+            if (wsConversationId) saveMessage(wsConversationId, 'assistant', nudgeText, { nudge: true });
+            nudgeSentForTurn = true;
+            lastAssistantAt = Date.now();
         };
 
         // Extract clinical fields from a user's utterance and merge into conversations.clinical_data
@@ -632,6 +656,18 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         // Kick off extraction asynchronously
                         extractClinical(conversationId, text);
 
+                        // Track timing for nudge and schedule no-dead-air safeguard
+                        lastUserAt = Date.now();
+                        nudgeSentForTurn = false;
+                        if (nudgeTimer) { try { clearTimeout(nudgeTimer); } catch {} }
+                        nudgeTimer = setTimeout(() => {
+                            const now = Date.now();
+                            // If assistant hasn't spoken since the user's last utterance
+                            if (!nudgeSentForTurn && (now - Math.max(lastAssistantAt, lastUserAt) >= 4000)) {
+                                sendNoDeadAirNudge();
+                            }
+                        }, 4200);
+
                         // Detect goodbye/exit intent and provide summary + closing prompt (but do NOT hang up yet)
                         if (!pendingClosing && /(goodbye|bye\b|have to go|hang up|end the call|gotta go|that is all|that's all|nothing else|no, that's it)/i.test(text)) {
                             // If required sections are not covered, ask for what's missing instead of closing
@@ -771,6 +807,9 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     if (text && wsConversationId) {
                         saveMessage(wsConversationId, 'assistant', text, { from: 'audio_transcript' });
                     }
+                    // Assistant spoke; suppress pending nudges
+                    lastAssistantAt = Date.now();
+                    nudgeSentForTurn = true;
                 }
 
                 // Handle conversation item creation for better message tracking
@@ -811,6 +850,9 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         } else {
                             saveMessage(conversationId, 'assistant', content, { item_id: item.id });
                         }
+                        // Any assistant item counts as activity
+                        lastAssistantAt = Date.now();
+                        nudgeSentForTurn = true;
                     }
                 }
             } catch (error) {
