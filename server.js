@@ -49,25 +49,52 @@ Critical dialog rule:
 
 Empathy and validation:
 - Use brief, genuine reflections and validations before your next question.
-- Examples: "I’m sorry you’re going through that.", "That sounds really uncomfortable.", "Thank you for sharing that; it’s helpful for your care."
+- Examples: "I'm sorry you're going through that.", "That sounds really uncomfortable.", "Thank you for sharing that; it's helpful for your care."
 
-Comprehensive intake topics to cover naturally (do not read as a checklist; weave them into conversation based on context):
-- Chief complaint onset, duration, severity, triggers/relievers, associated symptoms
-- Past medical history: chronic conditions (e.g., hypertension, diabetes, asthma), prior hospitalizations, major illnesses
-- Past surgical history and dates
-- Medications: prescription, OTC, supplements; dosages and adherence
+EPILEPSY-FOCUSED INTAKE PROTOCOL:
+If the caller mentions epilepsy, seizures, convulsions, or related terms, immediately transition to the structured epilepsy-specific questioning sequence. Use empathetic, patient-centered language to build trust and rapport.
+
+PRIORITY OPENING QUESTIONS (Start with these immediately after identifying epilepsy):
+1. "What's the most important thing to you that you want to address at your appointment regarding your epilepsy?"
+2. "What is the most frustrating aspect of your epilepsy, and how has it impacted your daily life?"
+
+FOLLOW-UP PROBING QUESTIONS (Branch based on their responses to build deeper understanding):
+- "Can you describe when your epilepsy first started, including any triggers or patterns you've noticed?"
+- "What medications or treatments have you tried in the past, and how effective were they? Can you elaborate on any challenges or successes you've experienced?"
+- "Have you experienced any side effects from your epilepsy treatments, and how have they affected you? For example, how do they impact your daily activities or overall well-being?"
+- "Are there any recent changes in your seizure frequency, type, or severity that you want to discuss? If so, can you share more about what you've observed?"
+
+EPILEPSY CONVERSATION GUIDELINES:
+- Always maintain an empathetic and patient-centered tone
+- Ask open-ended questions to encourage detailed responses
+- Follow up naturally for clarity and deeper insights
+- Focus on their personal history and experiences
+- Adapt follow-up questions to delve deeper where needed
+- Ensure dialogue remains supportive and tailored to patient needs
+- Build trust through validation: "That sounds challenging to manage.", "I can understand how that would be concerning."
+- Acknowledge their expertise about their own condition: "You know your body best."
+
+ADDITIONAL EPILEPSY TOPICS (Weave naturally into conversation based on responses):
+- Seizure semiology: "Can you walk me through what happens during a typical seizure for you?"
+- Medication adherence: "How are you managing with your current seizure medications?"
+- Safety measures: "What safety measures or plans do you have in place?"
+- Quality of life impact: "How has epilepsy affected the things that matter most to you?"
+- Support system: "What kind of support do you have from family or friends?"
+- Work/school impact: "How has epilepsy affected your work or daily activities?"
+
+When discussing epilepsy:
+- Be sensitive to stigma and emotional impact
+- Validate their experiences and feelings
+- Focus on their personal journey and individual needs
+- Document detailed responses for personalized care planning
+- Show genuine interest in their well-being beyond just medical facts
+
+GENERAL INTAKE TOPICS (Cover after epilepsy-specific focus):
+- Past medical history: chronic conditions, prior hospitalizations, major illnesses
+- Current medications: prescription, OTC, supplements; dosages and adherence
 - Allergies: medications, foods, environmental; reactions
-- Family history: major conditions in first-degree relatives (cardiac disease, cancer, diabetes, stroke, mental health)
-- Social history: tobacco/vaping, alcohol, recreational drugs; occupation; living situation; exercise; diet
-- Gynecologic/OB history when appropriate: LMP, pregnancy status, contraception, relevant screenings
-- Immunizations and preventive care: recent vaccines, screenings (colonoscopy, mammogram, Pap)
-
-Do not end the intake until you have reasonably covered the caller's:
-- Past medical history (chronic conditions, prior hospitalizations)
-- Medications and allergies
-- Family and social history as relevant
-If the caller tries to end early, acknowledge and provide a concise summary, then ask if there's anything else their provider should know. Only conclude if they indicate they're done.
-- Review of systems: brief screen guided by the chief complaint
+- Family history: major conditions in first-degree relatives
+- Social history: relevant lifestyle factors
 
 Before closing, ask: "Is there anything else you'd like your provider to know before your visit?"
 Keep responses concise, compassionate, and easy to understand.`;
@@ -274,6 +301,12 @@ fastify.register(async (fastify) => {
         let coveredPMH = false; // medical_history
         let coveredMeds = false; // current_medications
         let coveredAllergies = false; // allergies
+        // Epilepsy-specific coverage tracking
+        let coveredEpilepsyHistory = false; // epilepsy_age_onset, seizure_frequency, seizure_type
+        let coveredEpilepsyMeds = false; // epilepsy_medications, seizure_side_effects
+        let coveredEpilepsySafety = false; // seizure_triggers, last_seizure_date, seizure_emergency_measures
+        let coveredEpilepsyImpact = false; // epilepsy_family_history, seizure_impact
+        let isEpilepsyFlow = false; // flag to track if we're in epilepsy-specific flow
 
         // Normalize conversation_id from the WS URL (avoid 'null' string)
         const qs = req.url.split('?')[1] || '';
@@ -308,11 +341,48 @@ fastify.register(async (fastify) => {
             }
         };
 
+        // Get next epilepsy-specific question based on structured priority approach
+        let priorityQuestionsAsked = 0;
+        const getNextEpilepsyQuestion = () => {
+            // Start with priority opening questions
+            if (priorityQuestionsAsked === 0) {
+                priorityQuestionsAsked++;
+                return "What's the most important thing to you that you want to address at your appointment regarding your epilepsy?";
+            }
+            if (priorityQuestionsAsked === 1) {
+                priorityQuestionsAsked++;
+                return "What is the most frustrating aspect of your epilepsy, and how has it impacted your daily life?";
+            }
+            
+            // Follow-up probing questions based on coverage
+            if (!coveredEpilepsyHistory) return "Can you describe when your epilepsy first started, including any triggers or patterns you've noticed?";
+            if (!coveredEpilepsyMeds) return "What medications or treatments have you tried in the past, and how effective were they? Can you elaborate on any challenges or successes you've experienced?";
+            if (!coveredEpilepsyMeds) return "Have you experienced any side effects from your epilepsy treatments, and how have they affected you? For example, how do they impact your daily activities or overall well-being?";
+            if (!coveredEpilepsySafety) return "Are there any recent changes in your seizure frequency, type, or severity that you want to discuss? If so, can you share more about what you've observed?";
+            if (!coveredEpilepsyHistory) return "Can you walk me through what happens during a typical seizure for you?";
+            if (!coveredEpilepsySafety) return "What safety measures or plans do you have in place?";
+            if (!coveredEpilepsyImpact) return "How has epilepsy affected the things that matter most to you?";
+            if (!coveredEpilepsyImpact) return "What kind of support do you have from family or friends?";
+            return null; // All epilepsy topics covered
+        };
+
         // Send a brief acknowledgment and a next-step question if no response is generated
         const sendNoDeadAirNudge = () => {
             if (nudgeSentForTurn || pendingClosing || openAiWs.readyState !== WebSocket.OPEN) return;
             try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
-            const nudgeText = "Thanks, I’ve noted that. Could you tell me about any medication or other allergies you have, and what reactions you’ve had?";
+
+            let nudgeText;
+            if (isEpilepsyFlow) {
+                const nextEpilepsyQuestion = getNextEpilepsyQuestion();
+                if (nextEpilepsyQuestion) {
+                    nudgeText = `Thank you for sharing that. ${nextEpilepsyQuestion}`;
+                } else {
+                    nudgeText = "Thanks, I’ve noted that. Could you tell me about any medication or other allergies you have, and what reactions you’ve had?";
+                }
+            } else {
+                nudgeText = "Thanks, I’ve noted that. Could you tell me about any medication or other allergies you have, and what reactions you’ve had?";
+            }
+
             const nudgeItem = {
                 type: 'conversation.item.create',
                 item: {
@@ -345,7 +415,21 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
 - pain_level
 - duration
 - family_history
-- social_history`;
+- social_history
+- epilepsy_age_onset
+- seizure_frequency
+- seizure_type
+- seizure_triggers
+- epilepsy_medications
+- seizure_side_effects
+- last_seizure_date
+- seizure_emergency_measures
+- epilepsy_family_history
+- seizure_impact
+- epilepsy_priority_concern
+- epilepsy_frustration_impact
+- epilepsy_treatment_history
+- epilepsy_quality_of_life`;
 
                 const res = await fetch('https://api.openai.com/v1/chat/completions', {
                     method: 'POST',
@@ -398,7 +482,54 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                     'social history': 'social_history',
                     'social_history': 'social_history',
                     'duration': 'duration',
-                    'pain_level': 'pain_level'
+                    'pain_level': 'pain_level',
+                    // Epilepsy-specific field mappings
+                    'age of onset': 'epilepsy_age_onset',
+                    'age_onset': 'epilepsy_age_onset',
+                    'epilepsy_age_onset': 'epilepsy_age_onset',
+                    'seizure frequency': 'seizure_frequency',
+                    'seizure_frequency': 'seizure_frequency',
+                    'frequency': 'seizure_frequency',
+                    'seizure type': 'seizure_type',
+                    'seizure_type': 'seizure_type',
+                    'type of seizure': 'seizure_type',
+                    'seizure triggers': 'seizure_triggers',
+                    'seizure_triggers': 'seizure_triggers',
+                    'triggers': 'seizure_triggers',
+                    'epilepsy medications': 'epilepsy_medications',
+                    'epilepsy_medications': 'epilepsy_medications',
+                    'seizure medications': 'epilepsy_medications',
+                    'seizure meds': 'epilepsy_medications',
+                    'seizure side effects': 'seizure_side_effects',
+                    'seizure_side_effects': 'seizure_side_effects',
+                    'side effects': 'seizure_side_effects',
+                    'medication side effects': 'seizure_side_effects',
+                    'last seizure': 'last_seizure_date',
+                    'last_seizure': 'last_seizure_date',
+                    'last_seizure_date': 'last_seizure_date',
+                    'recent seizure': 'last_seizure_date',
+                    'seizure emergency measures': 'seizure_emergency_measures',
+                    'seizure_emergency_measures': 'seizure_emergency_measures',
+                    'emergency measures': 'seizure_emergency_measures',
+                    'emergency plan': 'seizure_emergency_measures',
+                    'epilepsy family history': 'epilepsy_family_history',
+                    'epilepsy_family_history': 'epilepsy_family_history',
+                    'family epilepsy': 'epilepsy_family_history',
+                    'seizure impact': 'seizure_impact',
+                    'seizure_impact': 'seizure_impact',
+                    'impact': 'seizure_impact',
+                    'how it affects me': 'seizure_impact',
+                    // Priority question mappings
+                    'priority concern': 'epilepsy_priority_concern',
+                    'most important': 'epilepsy_priority_concern',
+                    'epilepsy_priority_concern': 'epilepsy_priority_concern',
+                    'frustration': 'epilepsy_frustration_impact',
+                    'frustrating aspect': 'epilepsy_frustration_impact',
+                    'epilepsy_frustration_impact': 'epilepsy_frustration_impact',
+                    'treatment history': 'epilepsy_treatment_history',
+                    'epilepsy_treatment_history': 'epilepsy_treatment_history',
+                    'quality of life': 'epilepsy_quality_of_life',
+                    'epilepsy_quality_of_life': 'epilepsy_quality_of_life'
                 };
                 const toSnake = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
                 const normalizeKey = (k) => {
@@ -522,6 +653,20 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         if (updated.medical_history) coveredPMH = true;
                         if (updated.current_medications) coveredMeds = true;
                         if (updated.allergies) coveredAllergies = true;
+
+                        // Update epilepsy-specific coverage flags
+                        if (updated.epilepsy_age_onset || updated.seizure_frequency || updated.seizure_type) {
+                            coveredEpilepsyHistory = true;
+                        }
+                        if (updated.epilepsy_medications || updated.seizure_side_effects) {
+                            coveredEpilepsyMeds = true;
+                        }
+                        if (updated.seizure_triggers || updated.last_seizure_date || updated.seizure_emergency_measures) {
+                            coveredEpilepsySafety = true;
+                        }
+                        if (updated.epilepsy_family_history || updated.seizure_impact) {
+                            coveredEpilepsyImpact = true;
+                        }
                     }
                 } catch {}
             } catch (e) {
@@ -656,6 +801,33 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                         // Kick off extraction asynchronously
                         extractClinical(conversationId, text);
 
+                        // Detect epilepsy keywords and switch to epilepsy flow
+                        const epilepsyKeywords = /\b(epilepsy|seizure|seizures|convulsion|convulsions|tonic.clonic|absence|myoclonic|clonic|atonic|epileptic|fits|spells)\b/i;
+                        if (epilepsyKeywords.test(text) && !isEpilepsyFlow) {
+                            isEpilepsyFlow = true;
+                            console.log('Epilepsy keywords detected, switching to epilepsy-specific flow');
+
+                            // Provide empathetic acknowledgment and start with priority questions
+                            const epilepsyTransition = "I understand you've mentioned epilepsy. I want to make sure we focus on what's most important to you. What's the most important thing to you that you want to address at your appointment regarding your epilepsy?";
+                            try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
+                            const transitionItem = {
+                                type: 'conversation.item.create',
+                                item: {
+                                    type: 'message',
+                                    role: 'assistant',
+                                    content: [{ type: 'input_text', text: epilepsyTransition }]
+                                }
+                            };
+                            openAiWs.send(JSON.stringify(transitionItem));
+                            openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                            saveMessage(conversationId, 'assistant', epilepsyTransition, { epilepsy_transition: true });
+                            // Reset priority questions counter for this conversation
+                            priorityQuestionsAsked = 1; // First priority question just asked
+                            lastAssistantAt = Date.now();
+                            nudgeSentForTurn = true;
+                            return; // Skip normal conversation flow for this turn
+                        }
+
                         // Track timing for nudge and schedule no-dead-air safeguard
                         lastUserAt = Date.now();
                         nudgeSentForTurn = false;
@@ -675,6 +847,14 @@ Identify and extract as a flat JSON object of key:value pairs only for fields th
                             if (!coveredPMH) missing.push('your past medical history, like any chronic conditions or prior hospitalizations');
                             if (!coveredMeds) missing.push('the medications or supplements you currently take');
                             if (!coveredAllergies) missing.push('any medication or other allergies');
+
+                            // Add epilepsy-specific missing information if in epilepsy flow
+                            if (isEpilepsyFlow) {
+                                if (!coveredEpilepsyHistory) missing.push('your seizure history, including how old you were when seizures started and how often they occur');
+                                if (!coveredEpilepsyMeds) missing.push('your seizure medications and any side effects you experience');
+                                if (!coveredEpilepsySafety) missing.push('seizure triggers and your emergency measures');
+                                if (!coveredEpilepsyImpact) missing.push('how seizures affect your life and family history of epilepsy');
+                            }
                             if (missing.length > 0) {
                                 const followUp = `I understand we may need to wrap up soon. Before we do, I still need ${missing.join(' and ')} to make sure your provider has what they need. Could you share that now?`;
                                 try { openAiWs.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
